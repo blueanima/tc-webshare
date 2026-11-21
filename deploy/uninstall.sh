@@ -15,6 +15,8 @@
 # Copyright (C) 2026 tc-webshare contributors - GPL-3.0-or-later.
 # ---------------------------------------------------------------------------
 set -eu
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
 
 PKG_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "${PKG_ROOT}/deploy/common.sh"
@@ -26,7 +28,7 @@ STATE_DIR=${WEB_ROOT}/state
 BOOT_SH=${TC_BOOT_SH:-/mnt/Flash/boot.sh}
 MANIFEST=${STATE_DIR}/manifest
 NONWEB_SNAPSHOT=${STATE_DIR}/boot.nonweb
-PIDFILE=${STATE_DIR}/httpd.pid
+PIDFILE=${STATE_DIR}/bozohttpd.pid
 PURGE_DATA=0
 
 say() { printf '%s\n' "$*"; }
@@ -53,7 +55,9 @@ guard_path SHARE_DIR "${SHARE_DIR}"
 [ -f "${BOOT_SH}" ] || die "boot.sh missing: ${BOOT_SH}"
 
 HAS_MARK=0
-[ "$(marker_count "${BOOT_SH}")" -ne 0 ] && HAS_MARK=1
+if [ "$(marker_count "${BOOT_SH}")" -ne 0 ]; then
+    HAS_MARK=1
+fi
 
 if [ ! -d "${WEB_ROOT}" ] && [ "${HAS_MARK}" -eq 0 ]; then
     say "already clean: no ${WEB_ROOT} and no tc-webshare marker in boot.sh"
@@ -143,19 +147,34 @@ say "=== removing managed artifacts ==="
 if [ -L "${SHARE_DIR}/.htpasswd" ] || [ -e "${SHARE_DIR}/.htpasswd" ]; then
     rm -f "${SHARE_DIR}/.htpasswd"
 fi
-if [ -f "${SHARE_DIR}/cgi-bin/.tc-webshare-link" ]; then
-    rm -f "${SHARE_DIR}/cgi-bin/.tc-webshare-link"
-    rm -f "${SHARE_DIR}/cgi-bin/.htpasswd"
-    rmdir "${SHARE_DIR}/cgi-bin" 2>/dev/null || true
-fi
-rm -rf "${WEB_ROOT}"
-say "removed ${WEB_ROOT}"
-rm -f "${TMP_NONWEB}"
+
+# When the disk is unmounted, SHARE_DIR is <WEB_ROOT>/data.  A plain
+# `rm -rf WEB_ROOT` would delete user uploads even without --purge-data, so
+# remove only the managed subdirectories in that case.
+DATA_INSIDE_ROOT=0
+case "${SHARE_DIR}" in
+    "${WEB_ROOT}"/*) DATA_INSIDE_ROOT=1 ;;
+esac
 
 if [ "${PURGE_DATA}" -eq 1 ]; then
     warn "--purge-data supplied; deleting ${SHARE_DIR}"
-    rm -rf "${SHARE_DIR}"
+    rm -rf "${WEB_ROOT}"
+    [ "${DATA_INSIDE_ROOT}" -eq 1 ] || rm -rf "${SHARE_DIR}"
+    say "removed ${WEB_ROOT} and user data"
+elif [ "${DATA_INSIDE_ROOT}" -eq 1 ]; then
+    for managed_sub in bin etc state cgi-bin; do
+        if [ -d "${WEB_ROOT}/${managed_sub}" ]; then
+            rm -rf "${WEB_ROOT}/${managed_sub}"
+        fi
+    done
+    say "managed subdirectories removed; data preserved at ${SHARE_DIR}"
 else
+    rm -rf "${WEB_ROOT}"
+    say "removed ${WEB_ROOT}"
+fi
+rm -f "${TMP_NONWEB}"
+
+if [ "${PURGE_DATA}" -eq 0 ]; then
     say "user data preserved: ${SHARE_DIR}"
 fi
 

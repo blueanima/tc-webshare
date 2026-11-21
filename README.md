@@ -24,11 +24,11 @@ This repository contains source, scripts and documentation only. All builds happ
 | SATA disk | `/dev/ld0` exists but was **unmounted** (`/Volumes/` empty) at probe time; Apple mounts it on demand as `/Volumes/dk2` **or** `/Volumes/dk3`, the number changes every boot, it unmounts when idle, and **binaries cannot be executed from it** |
 | Boot hook | `/mnt/Flash/boot.sh` belongs to **TimeCapsuleSMB**, ends with `exec /mnt/Flash/service manager`, is effectively read-only (`chmod u+w` / `u-w` window) |
 | TimeCapsuleSMB | Installed and complete (`/mnt/Flash/service` manager, `tcapsulesmb.conf`, `seed_profile.sh`, diskd/wcifsnd guards), but smbd was **not running** and there were no runtime logs — must not be treated as a deployment precondition |
-| Commands present | `/bin/sh`, `/bin/ls`, `/usr/bin/sed`, `/bin/df`, `/usr/bin/netstat`, `/usr/bin/tail`, partial `/usr/bin/find` |
-| Commands absent | `grep`, `head`, `mount`, `disklabel`, `file`; **tc-toolbox is not installed** |
+| Commands present | `/bin/sh`, `/bin/ls`, `/usr/bin/sed`, `/bin/df`, `/usr/bin/netstat`, `/usr/bin/tail`, `/bin/curl`, `/usr/bin/openssl` (`dgst -sha256`, `base64 -d`), plus `mkdir/cp/rm/mv/cat/ln/dd/date/sleep/ps/kill/sort/basename/expr` |
+| Commands absent | `grep`, `head`, `find`, `awk`, `tr`, `cut`, `base64`, `sha256sum`, `id`, `mktemp`, `stat`, `readlink`, `tee`, `wget`, `nc`, `mount`, `disklabel`, `file`; **tc-toolbox is not installed** |
 | Word size | 32-bit ⇒ **LFS mandatory**: `-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE` |
 
-The deployment scripts use only shell builtins plus the commands above and ordinary `mkdir`/`cp`/`rm`/`chmod`/`sleep`/`cat`/`kill`; `install.sh` checks them with `require_cmds` before touching any path.
+Every script sets `PATH=/bin:/sbin:/usr/bin:/usr/sbin` first (interactive SSH lacks `/sbin`). Scripts use only shell builtins plus the commands above; `install.sh` checks them with `require_cmds` before touching any path. QA confirmed Samba **is** running (139/445/548/22 LISTEN; the process is named `service`).
 
 Performance figures from the earlier design (15–25 MB/s downloads, 8–15 MB/s uploads, ≤500 MB safe per file, concurrency lock = 1) are **estimates inherited from the thttpd design and have not been re-measured with bozohttpd**.
 
@@ -39,26 +39,27 @@ Performance figures from the earlier design (15–25 MB/s downloads, 8–15 MB/s
 - its source ships inside the NetBSD source tree we already fetch, so no external thttpd tarball is needed;
 - the compile switches are documented upstream (`-DDO_HTPASSWD -DNO_SSL_SUPPORT -DNO_LUA_SUPPORT`) and were reproduced with the real toolchain;
 - it provides the same required features: CGI, directory index, HTTP Basic auth;
-- the exact CLI differs from thttpd and from older bozohttpd releases. Verified against `main.c` / `bozohttpd.8`: `-b` daemonise, `-I <port>` listen port (**not** `-p`, which is `public_html`), `-c <dir>` CGI directory, `-X` index, `-H` hide dotfiles, `-P <pidfile>` PID file, positional slashdir.
+- the exact CLI differs from thttpd and from older bozohttpd releases. Verified against `main.c` / `bozohttpd.8`: `-b` daemonise, `-I <port>` listen port (**not** `-p`, which is `public_html`), docroot is a **positional** argument (`-d` is debug), `-C .cgi <handler>` suffix-maps CGI, `-X` index (off by default), `-H` hide dotfiles, `-P <pidfile>` PID file, `-U <user>` for privilege drop (deliberately unused). There is **no `-D` / `-g`** option.
 
 ```
 Browser (LAN) --HTTP :8080--> bozohttpd (static ELF, slashdir=<SHARE_DIR>)
                                |-- GET /                    -> .htpasswd 401 / index / download
-                               `-- POST /cgi-bin/upload.cgi -> <WEB_ROOT>/cgi-bin/upload.cgi
-                                                               (sh shim -> static upload.bin)
+                               `-- POST /upload.cgi (-C .cgi -> <WEB_ROOT>/bin/upload_shim)
+                                                               -> static upload.bin
                                                                -> upload.lock (O_EXCL, concurrency=1)
                                                                -> <SHARE_DIR>/<basename>
 ```
 
-bozohttpd **rebuilds the CGI environment from scratch** and drops custom variables, so `upload.c`'s `TC_SHARE_DIR` / `TC_STATE_DIR` cannot simply be exported by the boot hook. A generated `/bin/sh` shim at `/cgi-bin/upload.cgi` re-supplies those two variables and `exec`s the static `upload.bin`. bozohttpd also resolves `.htpasswd` relative to the request directory and does **not** recurse, so links are installed in the web root *and* in `cgi-bin/`.
+bozohttpd **rebuilds the CGI environment from scratch** and drops custom variables, so `upload.c`'s `TC_SHARE_DIR` / `TC_STATE_DIR` cannot simply be exported by the boot hook. A generated `/bin/sh` shim in managed Flash `bin/` re-supplies those two variables and `exec`s the static `upload.bin`. `.htpasswd` is not recursive; using `-C .cgi` keeps the `/upload.cgi` request inside the docroot, so **one** `.htpasswd` link in the docroot protects both GET and POST.
 
 ### 3. Deployment path strategy
 
 - `ROOT_DIR` (binaries, config, state, manifest) defaults to **`/mnt/Flash/.tc_webshare`** — persistent and executable. Flash is only 2.7 MB; `install.sh` aborts if `df -k /mnt/Flash` reports under 1024 KiB free. Override with `TC_ROOT_DIR`.
-- `SHARE_DIR` (user data) is resolved **at install and again at every boot**: first explicit `TC_SHARE_DIR`; else the first writable `/Volumes/dkN` whose filesystem differs from `/Volumes`; else `/mnt/Memory/.tc_webshare/share` (tmpfs, volatile — a warning is printed). **No dkN number is ever hardcoded.**
+- `SHARE_DIR` (user data) is resolved **at install and again at every boot** by `detect_data_root()`: first explicit `TC_SHARE_DIR`; else the first writable `/Volumes/dkN` whose filesystem differs from `/Volumes` (via `ls` + `df`); else `<ROOT_DIR>/data` on Flash. **No dkN number is ever hardcoded**, and we never force a mount: Apple mounts the disk only when a client touches the share. The Flash fallback is small (the two binaries already use ~844 KiB); keep uploads small while the disk is unmounted.
 - Binaries never go on the disk (it unmounts on idle and cannot execute ELF); only data does.
-- The boot block is inserted **before** TimeCapsuleSMB's final `exec /mnt/Flash/service manager` line — appending after it would never run. Uninstall removes only the two marker lines and their contents and compares the rest of boot.sh line-for-line against `state/boot.nonweb` (no `sha256sum` on the device).
-- Stopped Samba (139/445 silent) is only a warning; it is no longer a deployment blocker. TimeCapsuleSMB's files are never modified.
+- boot.sh has `set -eu` and ends with `echo 'boot: starting native manager'` + `exec /mnt/Flash/service manager`. The marker block is inserted **before the echo** and wrapped in `{ ...; } || true`, so our hook cannot stop Samba. Appending after `exec` would never run. chmod u+w/u-w brackets the write.
+- Uninstall removes only the two marker lines and their contents and compares the rest of boot.sh line-for-line against `state/boot.nonweb` (`sha256sum` is absent; `openssl dgst` is available if a hash is ever needed). If data lives inside the managed root, uninstall preserves it unless `--purge-data` is given.
+- Samba is currently running (139/445/548/22); silence would only produce a warning, never a deployment failure. TimeCapsuleSMB's files are never modified.
 
 ### 4. File tree
 
@@ -146,33 +147,33 @@ scp -O build_out/bin/httpd build_out/bin/upload.cgi \
     root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg/build_out/bin/
 ```
 
-Generate the hash on the build machine and deploy (the device has no `htpasswd`/`openssl`, so plaintext passwords are deliberately unsupported):
+Generate the crypt(3) hash on the build machine (e.g. `openssl passwd -1`) and deploy; the device has no `htpasswd`, so plaintext passwords are deliberately unsupported:
 
 ```sh
 TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 # Optional: TC_ROOT_DIR=... TC_SHARE_DIR=... ./deploy/install.sh
 ```
 
-`install.sh` guards paths, checks free Flash space, checks commands, tolerates inactive Samba, detects install vs. update mode, installs binaries/config/shim, writes credentials, inserts the marker block before the SMB `exec`, verifies boot.sh's non-Web lines, starts bozohttpd and checks port 8080.
+`install.sh` sets PATH, guards paths, checks free Flash space and commands, tolerates inactive Samba, detects install vs. update mode, installs binaries/config/shim, writes credentials, inserts the `|| true`-wrapped marker block before the native-manager echo, verifies boot.sh's non-Web lines, starts bozohttpd with `-b -I 8080 -C .cgi ... -X -H -P ...` and checks port 8080.
 
 Upload test (from a LAN client):
 
 ```sh
 curl -u admin:'<password>' -F 'file=@/path/to/test.txt' \
-     http://<device-lan-ip>:8080/cgi-bin/upload.cgi
+     http://<device-lan-ip>:8080/upload.cgi
 # Expect "OK files=1 bytes=..." and the file in SHARE_DIR
 ```
 
 ### 7. Verification checklist
 
-- [ ] `netstat -an | tail -40` shows 8080 LISTEN (Samba 139/445 may be absent)
-- [ ] `wget -S -O /dev/null http://127.0.0.1:8080/` → 401 (if a client exists)
+- [ ] `netstat -an | sed -n '/LISTEN/p'` shows 8080 (Samba 139/445/548 normally present)
+- [ ] `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/` → 401
 - [ ] authenticated GET / → 200 with a directory index, no `.htpasswd` listed
-- [ ] upload returns 200 and the file lands in the **resolved** share dir
+- [ ] POST to `/upload.cgi` → 200 and the file lands in the **resolved** share dir
 - [ ] duplicate filenames get `.1` suffixes; bad filenames get 400
-- [ ] `boot.sh` contains exactly one marker block, placed before the `exec` line
+- [ ] `boot.sh` contains exactly one marker block, before the `starting native manager` echo, `|| true` wrapped; Samba still starts
 - [ ] `state/boot.nonweb` matches the non-marker lines of boot.sh
-- [ ] after unmounting the disk, the boot hook still starts using the tmpfs fallback
+- [ ] after the disk unmounts, the boot hook still starts using the Flash `data/` fallback
 - [ ] TimeCapsuleSMB files are untouched; no tcn marker lines remain after uninstall
 
 ### 8. Rollback
@@ -215,10 +216,11 @@ GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSM
 | 开机钩子 | `/mnt/Flash/boot.sh` 属于 **TimeCapsuleSMB**，结尾是 `exec /mnt/Flash/service manager`，写前需 `chmod u+w` |
 | TimeCapsuleSMB | 已安装且完整，但 smbd **未运行**、无运行日志——不能作为部署前置条件 |
 | 可用命令 | `/bin/sh`、`/bin/ls`、`/usr/bin/sed`、`/bin/df`、`/usr/bin/netstat`、`/usr/bin/tail`、部分 `/usr/bin/find` |
-| 缺失命令 | `grep`、`head`、`mount`、`disklabel`、`file`；**tc-toolbox 未安装** |
+| 可用命令补充 | `/bin/curl`、`/usr/bin/openssl`（可 `dgst -sha256`、`base64 -d`）、`sort/basename/expr/dd/ps` 等 |
+| 缺失命令 | `grep`、`head`、`find`、`awk`、`tr`、`cut`、`base64`、`sha256sum`、`id`、`mktemp`、`stat`、`readlink`、`tee`、`wget`、`nc`、`mount`、`disklabel`、`file`；**tc-toolbox 未安装** |
 | 字长 | 32 位 ⇒ **LFS 必开** |
 
-部署脚本只用 shell 内建 + 上述命令 + `mkdir/cp/rm/chmod/sleep/cat/kill`，并在动手前用 `require_cmds` 检查。旧文档里的性能数字是 thttpd 时代的经验值，**bozohttpd 未重新实测**。
+每个脚本首先设 `PATH=/bin:/sbin:/usr/bin:/usr/sbin`（交互 SSH 缺 `/sbin`）。脚本只用 shell 内建与上述命令，动手前用 `require_cmds` 检查。QA 确认 Samba **正在运行**（139/445/548/22 LISTEN，进程名是 `service`）。旧文档里的性能数字是 thttpd 时代的经验值，**bozohttpd 未重新实测**。
 
 ### 2. 为何改用 bozohttpd
 
@@ -227,17 +229,18 @@ GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSM
 - 源码就在我们已下载的 NetBSD 源码树里，不再需要外部 thttpd 包；
 - 官方编译开关已用真工具链复现：`-DDO_HTPASSWD -DNO_SSL_SUPPORT -DNO_LUA_SUPPORT`；
 - CGI、目录索引、Basic auth 功能等价；
-- 参数与 thttpd 及旧版文档都不同（已查 `main.c` / `bozohttpd.8`）：`-b` 后台、`-I <port>` 端口（**不是** `-p`，那是 public_html）、`-c <dir>` CGI 目录、`-X` 索引、`-H` 隐藏点文件、`-P <pidfile>`、位置参数为站点根目录。
+- 参数与 thttpd 及旧版文档都不同（已查 `main.c` / `bozohttpd.8`）：`-b` 后台、`-I <port>` 端口（**不是** `-p`，那是 public_html）、docroot 是**位置参数**（`-d` 是 debug）、`-C .cgi <handler>` 后缀映射 CGI、`-X` 索引（默认关）、`-H` 隐藏点文件、`-P <pidfile>`、`-U <user>` 切用户（本包不用）。**没有 `-D` / `-g` 选项。**
 
-bozohttpd 会**重建 CGI 环境**，自定义变量全部丢失，所以 `upload.c` 依赖的 `TC_SHARE_DIR` / `TC_STATE_DIR` 由生成的 `/bin/sh` 垫片在 `/cgi-bin/upload.cgi` 处补上再 `exec` 静态 `upload.bin`。`.htpasswd` 按请求目录查找且不递归，因此站点根目录和 `cgi-bin/` 都要放链接。
+bozohttpd 会**重建 CGI 环境**，自定义变量全部丢失，所以 `upload.c` 依赖的 `TC_SHARE_DIR` / `TC_STATE_DIR` 由 managed Flash `bin/` 里的 `/bin/sh` 垫片补上再 `exec` 静态 `upload.bin`。`.htpasswd` 不递归；用 `-C .cgi` 让 `/upload.cgi` 请求落在 docroot，因此**一份** docroot `.htpasswd` 同时保护 GET 与 POST。
 
 ### 3. 部署路径策略
 
 - `ROOT_DIR`（二进制/配置/状态）默认 **`/mnt/Flash/.tc_webshare`**，持久且可执行。Flash 只有 2.7MB，安装前用 `df -k` 检查，低于 1024 KiB 直接失败。
-- `SHARE_DIR`（用户数据）在安装与每次开机时**动态解析**：显式 `TC_SHARE_DIR` > 第一个已挂载且可写的 `/Volumes/dkN` > `/mnt/Memory/.tc_webshare/share`（tmpfs，易失，会告警）。**绝不硬编码 dkN 编号。**
+- `SHARE_DIR`（用户数据）由 `detect_data_root()` 在安装与每次开机时**动态解析**：显式 `TC_SHARE_DIR` > 第一个已挂载且可写的 `/Volumes/dkN`（`ls` + `df` 判定）> `<ROOT_DIR>/data`（Flash）。**绝不硬编码 dkN 编号，也不主动触发挂载**（Apple 只在客户端访问共享时挂盘）。Flash 回退空间很小，硬盘未挂载时请控制上传体积。
 - 二进制不放硬盘（会卸载且不能执行），硬盘只放数据。
-- boot 标记块插在 TimeCapsuleSMB 的 `exec /mnt/Flash/service manager` **之前**；卸载只删标记块，并逐行比对 boot.sh 其余内容与 `state/boot.nonweb`（设备无 `sha256sum`）。
-- Samba 未启动仅告警，不再是部署阻断条件；TimeCapsuleSMB 文件绝不改动。
+- boot.sh 带 `set -eu`，结尾是 `echo 'boot: starting native manager'` + `exec /mnt/Flash/service manager`。标记块插在 **echo 之前**并用 `{ ...; } || true` 包裹，避免我们的 hook 非零导致 Samba 起不来；写前 `chmod u+w`、写后 `u-w`。
+- 卸载只删标记块，并逐行比对 boot.sh 其余内容与 `state/boot.nonweb`（设备无 `sha256sum`，必要时可用 `openssl dgst`）。数据若位于管理根目录内，默认卸载也会保留，除非 `--purge-data`。
+- Samba 当前在运行；即使未监听也仅告警，不阻断部署。TimeCapsuleSMB 文件绝不改动。
 
 ### 4. 文件树
 
@@ -276,12 +279,12 @@ scp -O -r tc-webshare root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg
 scp -O build_out/bin/httpd build_out/bin/upload.cgi \
     root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg/build_out/bin/
 
-# 设备无 htpasswd/openssl，必须先在本地生成 crypt(3) hash
+# 设备无 htpasswd，必须先在本地（openssl passwd -1）生成 crypt(3) hash
 TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 ```
 
-`install.sh` 会做路径守卫、Flash 剩余空间检查、命令检查；容忍 Samba 未启动；识别首次安装/原地更新；安装二进制、配置与 CGI 垫片；写入凭据；在 SMB `exec` 前插入标记块；校验 boot.sh 非 Web 行；拉起 bozohttpd 并检查 8080。
+`install.sh` 会先设 PATH，再做路径守卫、Flash 剩余空间检查、命令检查；容忍 Samba 未启动；识别首次安装/原地更新；安装二进制、配置与 CGI 垫片；写入凭据；在 `starting native manager` 前插入 `|| true` 包裹的标记块；校验 boot.sh 非 Web 行；以 `-b -I 8080 -C .cgi ... -X -H -P ...` 拉起 bozohttpd 并检查 8080。
 
 ### 7. 验证清单 / 8. 回退 / 9. 安全 / 10. 许可
 
-见英文版对应章节：重点确认 8080 LISTEN、401 认证、上传落点、标记块位置、`state/boot.nonweb` 一致、硬盘卸载后 tmpfs 回退仍可用、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据，`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；GPL-3.0-or-later。
+见英文版对应章节：重点确认 8080 LISTEN、401 认证、`/upload.cgi` 上传落点、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、硬盘卸载后 Flash `data/` 回退仍可用、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；GPL-3.0-or-later。

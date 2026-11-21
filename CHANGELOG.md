@@ -35,21 +35,28 @@ build adaptation**, not a feature release.
 - Default managed root moved from `/Volumes/dk2` to
   `/mnt/Flash/.tc_webshare` (persistent, executable). Data dir is resolved
   at install **and every boot**: mounted `/Volumes/dkN` if present, else
-  `/mnt/Memory/.tc_webshare/share`. No dkN number is hardcoded.
+  `/mnt/Flash/.tc_webshare/data`. No dkN number is hardcoded.
   默认管理根目录改为 Flash；数据目录动态解析，不再硬编码 dkN。
-- bozohttpd CLI corrected against upstream source: `-b -I 8080 -i 0.0.0.0
-  -c <cgibin> -X -H -P <pidfile> <slashdir>` (old `-D/-p/-d` were wrong).
-  The marker block is inserted **before** `exec /mnt/Flash/service manager`
-  because boot.sh ends there; appending would be unreachable.
-  参数已按源码纠正；标记块插在 SMB `exec` 之前。
+- bozohttpd CLI corrected against upstream source: docroot is positional,
+  CGI uses `-C .cgi <handler>` (one argument), port is `-I 8080`; old
+  `-D/-p/-d` and two-argument `-c` were wrong.
+  参数已按源码纠正：docroot 为位置参数，CGI 用单参数 `-C .cgi`。
 - Generated `/bin/sh` CGI shim re-supplies `TC_SHARE_DIR` / `TC_STATE_DIR`
-  because bozohttpd rebuilds the CGI environment; `.htpasswd` links are
-  placed in both the web root and `cgi-bin/` because auth is not recursive.
-  CGI 垫片补回环境变量；两个目录都放 .htpasswd 链接。
-- Scripts now avoid grep/awk/head/mount/sha256sum/ps/find entirely; a new
-  `deploy/common.sh` provides shell-only helpers, and boot.sh verification
-  uses a line-exact `state/boot.nonweb` snapshot. Samba being stopped is a
-  warning, not a failure. TimeCapsuleSMB is never modified.
+  because bozohttpd rebuilds the CGI environment; `-C .cgi` keeps the request
+  in the docroot so a single `.htpasswd` link covers GET / and POST /upload.cgi.
+  CGI 垫片补回环境变量；`-C .cgi` 让一份 .htpasswd 覆盖全部请求。
+- QA-driven final corrections: docroot is POSITIONAL and `-C .cgi <handler>`
+  maps CGI (single-argument `-c` no longer used); one `.htpasswd` in docroot
+  covers GET / and POST /upload.cgi. The boot block goes **before**
+  `echo 'boot: starting native manager'` and is `{ ...; } || true` wrapped so
+  Samba still starts under boot.sh's `set -eu`. Every script sets
+  `PATH=/bin:/sbin:/usr/bin:/usr/sbin`. Data fallback is `<ROOT_DIR>/data` on
+  Flash (no forced mount; disk is Apple-mounted on demand). Uninstall
+  preserves that data unless `--purge-data`. Samba is in fact running; its
+  absence is only a warning. TimeCapsuleSMB is never modified.
+- Scripts avoid grep/awk/head/find/tr/cut/base64/sha256sum/mktemp/stat/mount
+  etc.; a new `deploy/common.sh` provides shell-only helpers, and boot.sh
+  verification uses a line-exact `state/boot.nonweb` snapshot.
   脚本不再依赖设备缺失的命令；Samba 未运行仅告警。
 - Credentials: `TC_WEB_PASS_HASH` is required (no htpasswd/openssl on device);
   no plaintext password is generated or read.

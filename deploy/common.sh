@@ -18,6 +18,12 @@
 # Copyright (C) 2026 tc-webshare contributors - GPL-3.0-or-later.
 # ---------------------------------------------------------------------------
 
+# The interactive SSH PATH on this firmware lacks /sbin and /usr/sbin.
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+ROOT_DIR=${ROOT_DIR:-/mnt/Flash/.tc_webshare}
+
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -98,9 +104,9 @@ df_fs() {
 }
 
 # Print the first /Volumes/dkN that is really mounted (different filesystem
-# from /Volumes itself) and writable.  dkN numbering changes at every boot,
-# so the number must NEVER be baked into a script.
-detect_data_volume() {
+# from /Volumes itself) and writable.  Uses ls only (no find).  dkN numbering
+# changes at every boot, so the number must NEVER be baked into a script.
+detect_data_root() {
     base_fs=$(df_fs /Volumes 2>/dev/null || true)
     [ -n "${base_fs}" ] || return 1
     listing=$(ls /Volumes 2>/dev/null || true)
@@ -121,19 +127,19 @@ detect_data_volume() {
     return 1
 }
 
-# User-data root.  Explicit TC_SHARE_DIR always wins; otherwise a mounted
-# disk is used (persistent) and a tmpfs fallback is used while the disk is
-# unmounted.  The disk unmounts on idle and cannot execute binaries, which is
-# why all binaries/config stay on Flash and only DATA lands here.
+# User-data root.  Explicit TC_SHARE_DIR always wins; otherwise a currently
+# mounted disk is used (Apple mounts it on demand and unmounts on idle, so we
+# never trigger a mount ourselves).  Fallback is a small data directory on
+# Flash; README documents the capacity limit.  Binaries never live on dkN.
 resolve_share_dir() {
     if [ -n "${TC_SHARE_DIR:-}" ]; then
         printf '%s\n' "${TC_SHARE_DIR}"
         return 0
     fi
-    if vol=$(detect_data_volume); then
+    if vol=$(detect_data_root); then
         printf '%s\n' "${vol}/share/web"
     else
-        printf '%s\n' "/mnt/Memory/.tc_webshare/share"
+        printf '%s\n' "${ROOT_DIR}/data"
     fi
 }
 
@@ -204,8 +210,11 @@ marker_count() {
     printf '%s\n' "${count}"
 }
 
-# Insert BLOCK before the TimeCapsuleSMB `exec /mnt/Flash/service manager`
-# line.  Appending after it would be dead code: boot.sh ends with exec.
+# Insert BLOCK before the last guard in TimeCapsuleSMB's boot.sh.  QA found
+# that boot.sh runs with `set -eu` and ends with
+# `echo 'boot: starting native manager'` followed by
+# `exec /mnt/Flash/service manager`; anything after exec is dead code.  We
+# insert before the echo (all `|| exit 1` guards have already passed there).
 insert_marker_block() {
     boot_file=$1
     block_file=$2
@@ -214,7 +223,7 @@ insert_marker_block() {
     : > "${out_file}"
     while IFS= read -r line || [ -n "${line}" ]; do
         case "${line}" in
-            *exec*"/mnt/Flash/service manager"*)
+            *"starting native manager"*|*exec*"/mnt/Flash/service manager"*)
                 if [ "${inserted}" -eq 0 ]; then
                     while IFS= read -r block_line || [ -n "${block_line}" ]; do
                         printf '%s\n' "${block_line}" >> "${out_file}"
@@ -226,7 +235,7 @@ insert_marker_block() {
         printf '%s\n' "${line}" >> "${out_file}"
     done < "${boot_file}"
     if [ "${inserted}" -eq 0 ]; then
-        warn "no 'exec /mnt/Flash/service manager' line found; appending marker at end of ${boot_file}"
+        warn "no native-manager marker line found in ${boot_file}; appending block at end"
         while IFS= read -r block_line || [ -n "${block_line}" ]; do
             printf '%s\n' "${block_line}" >> "${out_file}"
         done < "${block_file}"
