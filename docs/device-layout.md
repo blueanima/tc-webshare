@@ -46,12 +46,12 @@ named `service`, which is why an earlier `ps` grep missed it.
 ├── bin/
 │   ├── httpd                           static bozohttpd ELF, no INTERP/DYNAMIC
 │   ├── upload.bin                      static upload.cgi ELF, LFS enabled
-│   ├── manage.bin                      static list/mkdir/delete CGI (JSON,
+│   ├── manage.bin                      static list/mkdir/delete/move CGI (JSON,
 │   │                                   strict UTF-8 basename validation)
 │   ├── cgi_dispatch.sh                 generated /bin/sh dispatcher: restores
 │   │                                   TC_SHARE_DIR / TC_STATE_DIR and routes
 │   │                                   SCRIPT_NAME to upload.bin / manage.bin
-│   │                                   (list/mkdir/delete.cgi)
+│   │                                   (list/mkdir/delete/move.cgi)
 │   ├── boot_hook.sh                    POSIX sh, absolute paths only
 │   ├── tc_common.sh                    dependency-light helper library
 │   └── tc_paths.sh                     generated absolute-path constants

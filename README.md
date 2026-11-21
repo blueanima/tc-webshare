@@ -82,8 +82,8 @@ The management homepage is a **program file**: its master copy lives in managed 
 │   ├── env.sh                 cross env; TOOLCHAIN_DIR/SYSROOT/SRC_ROOT overrides, CC includes --sysroot
 │   ├── fetch_src.sh           idempotent NetBSD source download/unpack; reuses /wb-build/src
 │   └── build_thttpd.sh        historical name; builds httpd + upload.cgi + manage.cgi
-├── src/upload.c               streaming multipart upload CGI (v1.0.5: no post-body stdin drain)
-├── src/manage.c               list/mkdir/delete CGI (static, JSON, strict UTF-8 basename whitelist)
+├── src/upload.c               streaming multipart upload CGI (v1.0.6: strict UTF-8 filenames; v1.0.5: no post-body stdin drain)
+├── src/manage.c               list/mkdir/delete/move CGI (static, JSON, strict UTF-8 basenames)
 ├── deploy/
 │   ├── common.sh              dependency-light on-device helpers
 │   ├── install.sh / uninstall.sh
@@ -92,10 +92,12 @@ The management homepage is a **program file**: its master copy lives in managed 
 │   ├── htpasswd.example       placeholder only
 │   └── thttpd.conf            historical, informational only
 ├── docs/device-layout.md      on-device layout and ownership
-└── tests/                     local-only proof of the v1.0.5 upload fix
+└── tests/                     local-only proof of the v1.0.5/v1.0.6 fixes
     ├── cgi_response_repro.c   mirrors bozohttpd's socketpair CGI topology
     ├── run_upload_response_test.sh  proves bug on pre-fix CGI, PASS on current
-    └── index_ui_test.js       headless DOM/XHR test of the upload progress UI
+    ├── filename_validation_test.c   host test of the strict UTF-8 filename policy
+    ├── run_filename_validation_test.sh  compiles and runs the policy test
+    ├── index_ui_test.js       headless DOM/XHR test of the upload speed + move UI
 ```
 
 ### 5. Build (local / Docker, no hardware involved)
@@ -189,6 +191,13 @@ curl -u admin:'<password>' -H 'Expect:' -F 'file=@/path/to/test.txt' \
 # Failed when curl sends the default "Expect: 100-continue".
 ```
 
+**v1.0.6:** uploaded file names use the **same strict UTF-8 policy** as
+folder names, so a Chinese name such as `内网算力统筹与工作思路.docx`
+(or an emoji name) is accepted instead of returning HTTP 400. Malformed
+UTF-8, separators, `..`, controls and >200-byte names are still rejected;
+hidden files such as `.gitignore` remain valid. See the v1.0.6 section of
+[CHANGELOG.md](CHANGELOG.md).
+
 **v1.0.5:** the upload response now ends immediately after the multipart body
 is saved. If an older `upload.cgi` is still installed, the command above can
 hang until `--max-time` even though `upload.log` says `status=OK`, and it
@@ -201,8 +210,8 @@ Open `http://<device-lan-ip>:8080/` in a browser and pass the Basic auth
 dialog. The hidden management homepage is served automatically; the top
 toolbar offers **file upload** (multiple files, with a live progress bar),
 **new folder**, and refresh. The table below shows top-level entries with
-size, UTC mtime, download link, a **delete** button and directory markers,
-rendered from `/list.cgi` (JSON) without any CDN.
+size, UTC mtime, download link, a **move** button, a **delete** button and
+directory markers, rendered from `/list.cgi` (JSON) without any CDN.
 
 All selected files are posted in one multipart request; the progress bar
 therefore reports the **whole batch** (`req.upload.onprogress`), and the
@@ -220,12 +229,23 @@ Endpoints (all behind the same docroot `.htpasswd`):
 | `/mkdir.cgi` | POST `name=...` (form-urlencoded) or GET query | create a folder |
 | `/delete.cgi` | POST `name=...` (form-urlencoded) or GET query | delete one top-level file or empty directory |
 | `/upload.cgi` | POST multipart | existing streaming uploader |
+| `/move.cgi` | POST `name=...&to=...` (form-urlencoded) or GET query | move one top-level entry into an existing top-level folder |
 
-Names for mkdir/delete accept **printable ASCII (0x20–0x7E)** — spaces and
-common symbols such as `! @ # $ % & ' ( ) + , ; = [ ]` are allowed — **plus
-well-formed UTF-8 multibyte characters** (e.g. `家庭照片`), up to **200 bytes**.
-Rejected: `/`, `\`, any leading dot (which covers `.` and `..`), C0/C1/DEL
-control bytes and malformed UTF-8. Existing mkdir names return 409. Malformed
+`move.cgi` never overwrites: `name == to` or an existing destination entry
+returns 409, a symlink source/target or a non-directory target returns 403,
+a malformed name returns 400, and a missing source/target returns 404. It moves
+exactly one top-level entry one level down; there is no recursion and no way
+to address a nested path.
+
+Both names accept **printable ASCII (0x20–0x7E)** — spaces and common
+symbols such as `! @ # $ % & ' ( ) + , ; = [ ]` are allowed — **plus
+well-formed UTF-8 multibyte characters** (e.g. `家庭照片`,
+`内网算力统筹与工作思路.docx`, emoji), up to **200 bytes** each. Rejected for folders: `/`, `\`, any leading
+dot (which covers `.` and `..`), C0/C1/DEL control bytes and malformed UTF-8.
+For uploaded files the same character rules apply, but a leading dot is
+allowed (`.gitignore` is a valid upload name) while the complete `.` name, any
+`..` substring, and any path separator are refused. Existing mkdir names
+return 409. Malformed
 UTF-8 (overlong encodings, surrogates, values above U+10FFFF) is rejected too,
 so no byte sequence can bypass the basename checks. `list.cgi` returns raw UTF-8 in a `charset=utf-8` JSON body,
 which `JSON.parse` handles directly. Browser `FormData` uploads do not send
@@ -249,6 +269,8 @@ Responses: `200 {"ok":true,...}`, `400` bad name, `403` symlink/special file,
 - [ ] upload returns **immediately** after the file lands (no `--max-time` timeout); `state/upload.lock` is gone and no `upload.cgi` process remains
 - [ ] web UI shows a live speed next to the percentage and auto-hides/refreshes on completion
 - [ ] duplicate filenames get `.1` suffixes; bad filenames get 400
+- [ ] a Chinese/emoji filename (e.g. `内网算力统筹与工作思路.docx`) uploads with 200 and lands with that exact name; malformed UTF-8 and `../` names still get 400
+- [ ] the 移动 button opens a folder dropdown (excluding itself); with no folder it says `请先新建文件夹`; moving a Chinese-named file returns 200 and the file appears inside the target; a same-name destination returns 409
 - [ ] `boot.sh` contains exactly one marker block, before the `starting native manager` echo, `|| true` wrapped; Samba still starts
 - [ ] `state/boot.nonweb` matches the non-marker lines of boot.sh
 - [ ] after reboot the boot hook re-mounts the disk via acp and serves from `/Volumes/dk2/share/web`; if acp fails, a loud tmpfs warning is printed
@@ -265,9 +287,29 @@ Removes the marker block, verifies boot.sh against the install-time snapshot, st
 
 ### 9. Security notes
 
-Plaintext HTTP on a trusted wired LAN only; TLS is out of scope. `upload.c` whitelists `[A-Za-z0-9._-]` basenames, uses `O_EXCL|O_NOFOLLOW`, never overwrites, and serialises uploads with `upload.lock`. `manage.c` applies strict RFC 3629 UTF-8 validation to mkdir/delete names (valid Chinese names are allowed; malformed sequences, controls, separators, `..`, leading dots and >200-byte names are refused), and deletion is limited to a validated top-level basename: `lstat()` rejects symlinks, `rmdir()` refuses non-empty directories, no recursion is performed, and program/dotfiles are unreachable by name. Deletions are permanent. Credentials are supplied as a pre-computed crypt(3) hash; `htpasswd.example` is a placeholder. No plaintext password or credential file is read by this repository.
+Plaintext HTTP on a trusted wired LAN only; TLS is out of scope. `upload.c`
+and `manage.c` now share the same strict RFC 3629 validator: printable ASCII
+plus well-formed UTF-8 (Chinese/emoji) names are accepted, while malformed
+sequences, control bytes, separators, `..` and >200-byte names are refused.
+Uploaded files keep the older hidden-file behaviour (`.gitignore` is valid);
+folders still reject every leading dot. Uploads use `O_EXCL|O_NOFOLLOW`,
+never overwrite, get a numeric suffix on collision, and are serialised with
+`upload.lock`. Deletion is limited to a validated top-level basename: `lstat()` rejects
+symlinks, `rmdir()` refuses non-empty directories, no recursion is performed,
+and program/dotfiles are unreachable by name. `/move.cgi` validates both
+names the same way, requires the target to be a real (non-symlink) directory,
+never overwrites an existing entry (409), and only moves one top-level entry
+one level into an existing top-level folder — never across levels and never
+out of `TC_SHARE_DIR`. Deletions are permanent. Credentials are supplied as a pre-computed crypt(3) hash; `htpasswd.example` is a placeholder. No plaintext password or credential file is read by this repository.
 
-**v1.0.5 status:** built locally and validated with a simulated-CGI harness plus a headless UI test; **not yet deployed to the real device** — QA verification is required. The hardware-validated baseline remains v1.0.3 (see below); v1.0.4 added the management UI but had the upload-hang bug fixed in v1.0.5. New `upload.cgi` SHA-256: `04e35d26f7d25d86307f702f1f26a6343c9bb9e471cf5d2fadc648647c0a2cbd`.
+**v1.0.6 status:** built locally with the `tc_wb` cross toolchain and checked
+with a host-side filename-policy test plus a headless UI test; **not yet deployed to the real device**
+— QA verification is required. The hardware-validated baseline remains
+v1.0.3 (see below); v1.0.5 fixed the upload response deadlock and v1.0.6
+adds UTF-8 upload names plus the top-level→folder move endpoint. `httpd`
+is unchanged. New sha256 values: `upload.cgi` `4582a0ca1bfe40adab27a6760d00fa78e4916307fac671ddb472efa818fd98b8`,
+`manage.cgi` `dca20ba7541d682293daa973ba92f0a04fdd41af7c4a5e8c393a4093d35097b6` (previous v1.0.5 `upload.cgi` was
+`04e35d26f7d25d86307f702f1f26a6343c9bb9e471cf5d2fadc648647c0a2cbd`).
 
 ### 10. License
 
@@ -388,7 +430,7 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 
 #### 网页管理界面（v1.0.5）
 
-浏览器打开 `http://<设备IP>:8080/` 并通过 Basic auth 后，会自动看到隐藏的管理首页：顶部工具栏提供**多文件上传**（带实时进度条）、**新建文件夹**、刷新；下方表格显示顶层文件名、大小、UTC 修改时间、下载链接、**删除**按钮与目录标记，由 `/list.cgi`（JSON）渲染，完全离线、无外部 CDN。
+浏览器打开 `http://<设备IP>:8080/` 并通过 Basic auth 后，会自动看到隐藏的管理首页：顶部工具栏提供**多文件上传**（带实时进度条）、**新建文件夹**、刷新；下方表格显示顶层文件名、大小、UTC 修改时间、下载链接、**移动**按钮、**删除**按钮与目录标记，由 `/list.cgi`（JSON）渲染，完全离线、无外部 CDN。点击「移动」会从当前列表的文件夹中选择目标（排除自身），确认后调用 `/move.cgi`；若还没有任何文件夹，会提示「请先新建文件夹」。
 
 所选多个文件仍一次性 POST，因此进度条显示**整批**上传进度（`req.upload.onprogress`），上传期间禁用上传按钮。v1.0.5 起进度文字同时显示百分比与**平滑后的实时速度**（如 `45% · 2.3 MB/s`），完成消息附上整批平均速度；成功、网络错误与 `send()` 同步异常都会隐藏进度条并恢复按钮。故意不设 `req.timeout`，避免慢速网络上的大文件被误判超时。
 
@@ -402,16 +444,21 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 | `/mkdir.cgi` | POST 表单 `name=...` 或 GET query | 新建文件夹 |
 | `/delete.cgi` | POST 表单 `name=...` 或 GET query | 删除一个顶层文件或空目录 |
 | `/upload.cgi` | POST multipart | 原有流式上传 |
+| `/move.cgi` | POST 表单 `name=...&to=...` 或 GET query | 把一个顶层条目移动到已存在的顶层文件夹 |
 
-新建/删除的名称接受**可打印 ASCII 字符（0x20–0x7E，含空格与 `! @ # $ % & ' ( ) + , ; = [ ]` 等常见符号）**以及合法 UTF-8 多字节字符（如 `家庭照片`），最长 **200 字节**；仅拒绝 `/`、`\`、前导点（含 `.`、`..`）、C0/C1/DEL 控制字符与畸形 UTF-8，空格和常见符号是允许的。重名建文件夹返回 409。畸形 UTF-8（overlong、代理区、超出 U+10FFFF）同样拒绝，任何字节序列都无法绕过 basename 检查。`list.cgi` 以 `charset=utf-8` 返回原始 UTF-8 JSON，`JSON.parse` 可直接解析。浏览器 `FormData` 不会发送 `Expect: 100-continue`，因此网页上传不需要 curl 的 `-H 'Expect:'` 补丁。
+**v1.0.6 中文上传名**：上传文件名现在与文件夹名使用**同一套严格 UTF-8 校验**，`内网算力统筹与工作思路.docx`、emoji 名字等都能正常上传，不再返回 HTTP 400；畸形 UTF-8、分隔符、`..`、控制字节与超过 200 字节的名字仍拒绝，`.gitignore` 这类隐藏文件名仍可上传（详见英文版对应段落）。
+
+`/move.cgi` **绝不覆盖**：`name == to` 或目标已有同名条目返回 409；软链源/目标或目标不是目录返回 403；非法名返回 400；源或目标不存在返回 404。只允许「顶层 → 一层已有的顶层文件夹」，不递归、不跨层、不会移出 `TC_SHARE_DIR`。
+
+新建/删除/移动的名称接受**可打印 ASCII 字符（0x20–0x7E，含空格与 `! @ # $ % & ' ( ) + , ; = [ ]` 等常见符号）**以及合法 UTF-8 多字节字符（如 `家庭照片`），最长 **200 字节**；仅拒绝 `/`、`\`、前导点（含 `.`、`..`）、C0/C1/DEL 控制字符与畸形 UTF-8，空格和常见符号是允许的。重名建文件夹返回 409。畸形 UTF-8（overlong、代理区、超出 U+10FFFF）同样拒绝，任何字节序列都无法绕过 basename 检查。`list.cgi` 以 `charset=utf-8` 返回原始 UTF-8 JSON，`JSON.parse` 可直接解析。浏览器 `FormData` 不会发送 `Expect: 100-continue`，因此网页上传不需要 curl 的 `-H 'Expect:'` 补丁。
 
 **删除范围刻意收窄且不可恢复**：仅作用于 `TC_SHARE_DIR` 顶层；拒绝符号链接；普通文件用 `unlink()`，目录只用 `rmdir()`（**仅空目录，绝不递归**）；点文件与 `.htpasswd` / `.tc-webshare-index.html` 两个程序文件无法被命名；界面会二次确认。没有回收站、没有撤销，重要数据请自行备份。返回码：`200 {"ok":true,...}`、`400` 非法名、`403` 软链/特殊文件、`404` 不存在、`409` 目录非空、`500` 其他错误。
 
 ### 7. 验证清单 / 8. 回退 / 9. 安全 / 10. 许可
 
-见英文版对应章节：重点确认 8080 LISTEN、401 认证、`/upload.cgi` 上传落点（curl 必须加 `-H 'Expect:'`）、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、开机后 boot hook 通过 acp 重新挂载硬盘并继续使用 `/Volumes/dk2/share/web`（失败时明确告警并回退 Flash 小容量数据目录）、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；`manage.c` 对新建/删除名称执行严格 RFC 3629 UTF-8 校验（合法中文放行，畸形序列、控制字符、分隔符、`..`、前导点、超 200 字节拒绝）；删除仅限合法顶层 basename：`lstat()` 拒绝软链、`rmdir()` 拒绝非空目录、不递归、程序文件与点文件不可命名，且删除不可撤销。GPL-3.0-or-later。
+见英文版对应章节：重点确认 8080 LISTEN、401 认证、`/upload.cgi` 上传落点（curl 必须加 `-H 'Expect:'`）、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、开机后 boot hook 通过 acp 重新挂载硬盘并继续使用 `/Volumes/dk2/share/web`（失败时明确告警并回退 Flash 小容量数据目录）、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；`manage.c` 对新建/删除/移动名称执行严格 RFC 3629 UTF-8 校验（合法中文放行，畸形序列、控制字符、分隔符、`..`、前导点、超 200 字节拒绝）；上传文件名在 v1.0.6 起使用同款校验，但保留隐藏文件名（`.gitignore`）可上传；删除仅限合法顶层 basename：`lstat()` 拒绝软链、`rmdir()` 拒绝非空目录、不递归、程序文件与点文件不可命名，且删除不可撤销；移动仅限合法顶层 basename，目标必须是非软链的真实目录，同名条目一律 409，不跨层、不移出共享目录且不可覆盖。GPL-3.0-or-later。
 
-**v1.0.5 状态**：已在本机构建，并用模拟 CGI 拓扑的本地测试与无头 UI 测试验证；**尚未真机部署**，需 QA 验证后再上线。硬件上已验证的版本仍是 v1.0.3（见下）。新 `upload.cgi` SHA-256：`04e35d26f7d25d86307f702f1f26a6343c9bb9e471cf5d2fadc648647c0a2cbd`。
+**v1.0.6 状态**：已用 `tc_wb` 交叉工具链在本机构建，并用本机文件名策略测试与无头 UI 测试验证；**尚未真机部署**，需 QA 验证后再上线。硬件上已验证的版本仍是 v1.0.3（见下）；v1.0.5 修复了上传响应死锁，v1.0.6 补齐中文 UTF-8 上传文件名并加入「移动到文件夹」。`httpd` 未改动。新 SHA-256：`upload.cgi` `4582a0ca1bfe40adab27a6760d00fa78e4916307fac671ddb472efa818fd98b8`、`manage.cgi` `dca20ba7541d682293daa973ba92f0a04fdd41af7c4a5e8c393a4093d35097b6`；上一版 v1.0.5 `upload.cgi` 为 `04e35d26f7d25d86307f702f1f26a6343c9bb9e471cf5d2fadc648647c0a2cbd`。
 
 ### 11. 发布说明 — 真机验证结果（v1.0.2）
 

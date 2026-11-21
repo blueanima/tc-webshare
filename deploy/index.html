@@ -41,6 +41,13 @@ a{color:var(--accent);text-decoration:none}
 .progress-text{font-size:12px;color:var(--muted);min-width:118px;white-space:nowrap;font-variant-numeric:tabular-nums}
 button.mini{padding:4px 9px;font-size:12px;margin-left:10px}
 button.danger{background:var(--danger)}
+button.secondary{background:var(--muted)}
+.modal{position:fixed;inset:0;background:rgba(16,24,40,.5);display:flex;align-items:center;justify-content:center;padding:18px;z-index:10}
+.modal-card{background:#fff;border-radius:10px;padding:20px;min-width:320px;max-width:92vw;box-shadow:0 12px 32px rgba(16,24,40,.2)}
+.modal-card h2{margin:0 0 10px;font-size:16px}
+.modal-card p{margin:0 0 12px;color:var(--muted);font-size:13px;word-break:break-all}
+.modal-card label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:#fff;font:inherit;max-width:100%;margin-bottom:14px}
 </style>
 </head>
 <body>
@@ -85,6 +92,19 @@ button.danger{background:var(--danger)}
   </section>
 </main>
 
+<div class="modal" id="moveModal" hidden>
+  <div class="modal-card">
+    <h2>移动到文件夹</h2>
+    <p id="moveInfo"></p>
+    <label for="moveTarget">目标文件夹</label>
+    <select id="moveTarget"></select>
+    <div class="row">
+      <button id="moveConfirm" type="button">确认移动</button>
+      <button id="moveCancel" type="button" class="secondary">取消</button>
+    </div>
+  </div>
+</div>
+
 <script>
 (function () {
   'use strict';
@@ -96,6 +116,13 @@ button.danger{background:var(--danger)}
   var progressWrap = document.getElementById('progressWrap');
   var progressFill = document.getElementById('progressFill');
   var progressText = document.getElementById('progressText');
+  var moveModal = document.getElementById('moveModal');
+  var moveInfo = document.getElementById('moveInfo');
+  var moveTarget = document.getElementById('moveTarget');
+  var moveConfirm = document.getElementById('moveConfirm');
+  var moveCancel = document.getElementById('moveCancel');
+  var currentEntries = [];
+  var moveSource = '';
 
   /* v1.0.5: XHR onprogress fires in bursts, so sample at most ~8x/second and
    * smooth with an exponential moving average to keep the speed readable. */
@@ -164,6 +191,7 @@ button.danger{background:var(--danger)}
   }
 
   function render(entries) {
+    currentEntries = entries.slice();
     rowsEl.innerHTML = '';
     if (!entries.length) {
       rowsEl.innerHTML = '<tr><td colspan="4" class="empty">目录为空</td></tr>';
@@ -196,6 +224,16 @@ button.danger{background:var(--danger)}
         dl.textContent = '下载';
         op.appendChild(dl);
       }
+      /* 移动按钮位于下载与删除之间；目标来自当前列表里的目录。 */
+      var mv = document.createElement('button');
+      mv.type = 'button';
+      mv.className = 'mini';
+      mv.textContent = '移动';
+      mv.title = '移动到当前目录中的另一个文件夹';
+      mv.onclick = (function (entryName) {
+        return function () { openMove(entryName); };
+      })(e.name);
+      op.appendChild(mv);
       var del = document.createElement('button');
       del.type = 'button';
       del.className = 'mini danger';
@@ -209,6 +247,83 @@ button.danger{background:var(--danger)}
       rowsEl.appendChild(tr);
     });
   }
+
+  /* Backend errors are JSON: {"ok":false,"error":"..."}.  Fall back to the
+   * raw body if a proxy replaced it, e.g. with an HTML auth page. */
+  function errorText(req) {
+    try {
+      var parsed = JSON.parse(req.responseText);
+      if (parsed && parsed.error) return String(parsed.error);
+    } catch (err) { /* not JSON */ }
+    return String(req.responseText || '').trim();
+  }
+
+  function openMove(name) {
+    var folders = currentEntries.filter(function (e) {
+      return e.dir && e.name !== name;
+    });
+    if (!folders.length) {
+      status('请先新建文件夹', true);
+      return;
+    }
+    moveSource = name;
+    moveTarget.innerHTML = '';
+    folders.forEach(function (e) {
+      var opt = document.createElement('option');
+      opt.value = e.name;
+      opt.textContent = e.name;
+      moveTarget.appendChild(opt);
+    });
+    moveInfo.textContent = '将「' + name + '」移动到选中的文件夹（同名条目不会被覆盖）。';
+    moveModal.hidden = false;
+    if (typeof moveTarget.focus === 'function') moveTarget.focus();
+  }
+
+  function closeMove() {
+    moveModal.hidden = true;
+    moveSource = '';
+  }
+
+  function submitMove() {
+    var to = moveTarget.value;
+    var from = moveSource;
+    if (!from || !to) { closeMove(); return; }
+    closeMove();
+    status('正在移动…');
+    var req = new XMLHttpRequest();
+    var done = false;
+    req.open('POST', '/move.cgi', true);
+    req.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    req.onreadystatechange = function () {
+      if (req.readyState !== 4 || done) return;
+      done = true;
+      if (req.status === 200) {
+        /* refresh() clears the status line, so report AFTER refreshing. */
+        refresh();
+        status('已移动：' + from + ' → ' + to);
+        return;
+      }
+      if (req.status === 401) { status('会话认证已失效，请重新输入用户名/口令。', true); return; }
+      if (req.status === 400) { status('移动失败：名称不合法', true); return; }
+      if (req.status === 403) { status('移动失败：' + errorText(req), true); return; }
+      if (req.status === 404) { status('移动失败：源或目标文件夹不存在', true); return; }
+      if (req.status === 409) { status('移动失败：' + errorText(req), true); return; }
+      status('移动失败：HTTP ' + req.status + ' ' + errorText(req), true);
+    };
+    req.onerror = function () {
+      if (done) return;
+      done = true;
+      status('移动失败：网络错误，请检查连接后重试', true);
+    };
+    try {
+      req.send('name=' + encodeURIComponent(from) + '&to=' + encodeURIComponent(to));
+    } catch (err) {
+      if (!done) { done = true; status('移动失败：' + err.message, true); }
+    }
+  }
+
+  moveConfirm.onclick = submitMove;
+  moveCancel.onclick = closeMove;
 
   function deleteEntry(name, isDir) {
     var question = isDir

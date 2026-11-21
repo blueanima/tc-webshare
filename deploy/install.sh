@@ -256,7 +256,7 @@ chmod 0644 "${BIN_DIR}/tc_paths.sh"
     printf 'export TC_SHARE_DIR TC_STATE_DIR\n'
     printf '%s\n' 'case "${SCRIPT_NAME:-}" in'
     printf '  */upload.cgi) exec "%s" ;;\n' "${UPLOAD_BIN}"
-    printf '  */list.cgi|*/mkdir.cgi|*/delete.cgi) exec "%s" ;;\n' "${MANAGE_BIN}"
+    printf '  */list.cgi|*/mkdir.cgi|*/delete.cgi|*/move.cgi) exec "%s" ;;\n' "${MANAGE_BIN}"
     printf '%s\n' '  *) printf "Status: 404 Not Found\r\nContent-Type: text/plain\r\n\r\nunknown CGI\r\n"; exit 0 ;;'
     printf '%s\n' 'esac'
 } > "${CGI_SHIM}"
@@ -362,7 +362,7 @@ say "installed: ${WEB_ROOT}"
 say "data dir:  ${SHARE_DIR}"
 say "manifest:  ${MANIFEST}"
 say "server:    ${HTTPD} (bozohttpd)"
-say "CGI shim:  ${CGI_SHIM} -> /upload.cgi, /list.cgi, /mkdir.cgi, /delete.cgi (-C .cgi)"
+say "CGI shim:  ${CGI_SHIM} -> /upload.cgi, /list.cgi, /mkdir.cgi, /delete.cgi, /move.cgi (-C .cgi)"
 say "homepage:  ${SHARE_DIR}/${INDEX_FILE_NAME}"
 say "ports:     8080=LISTEN (Samba untouched)"
 if [ "${UPDATE_MODE}" -eq 1 ]; then

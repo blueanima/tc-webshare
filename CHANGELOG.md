@@ -1,5 +1,69 @@
 # Changelog / 变更记录
 
+## v1.0.6 — 2026-11-21 — 中文上传文件名 + 移动到文件夹 / UTF-8 upload names + move entry
+
+### 1. 修复：上传中文文件名被 400 拒绝 / Fix: Chinese upload filenames rejected
+
+用户实际上传 `内网算力统...作思路.docx` 报错 `HTTP 400 ERROR: filename
+rejected by security policy`，而同一界面「新建文件夹」却允许中文名。
+
+**根因**：v1.0.4 只给 `src/manage.c` 的 `valid_folder_name()` 接入了严格 UTF-8
+校验；`src/upload.c` 的 `valid_filename()` 仍是旧的 ASCII 白名单
+`[A-Za-z0-9._-]`，任何 ≥0x80 的字节直接被拒。两处安全强度不一致。
+
+**修复**：在 `upload.c` 内加入与 `manage.c` v1.0.4 **逐字节一致**的
+`valid_utf8_bytes()`（严格 RFC 3629：拒游离续字节、C0/C1、overlong、UTF-16
+代理区、>U+10FFFF、C0/C1/DEL 控制字节），`valid_filename()` 在保留全部旧
+安全边界后用该函数替代 ASCII 白名单。选择源码镜像而非共享头文件，是因为两个
+CGI 是独立静态二进制，且这样 `manage.c` 完全不动、其已发布哈希保持不变；
+两处函数需同步维护（代码注释已注明）。
+
+- 放行：中文、emoji、2/3/4 字节合法 UTF-8，以及可打印 ASCII 0x20–0x7E
+  （含空格与常见符号）；`.gitignore` 等隐藏文件名行为**保持不变**。
+- 仍拒绝：空名、`/`、`\`、任意 `..` 子串、单独的 `.`、NUL/控制字节、
+  >200 字节（按字节计）、畸形 UTF-8。
+- `upload.c` 额外增加任意位置的 `/` 检查（defence in depth）。
+- `../evil.txt` 这类带路径的 `Content-Disposition` 文件名现在在取 basename
+  **之前**就被 400 拒绝；以前会静默存成 `evil.txt`（虽然不会越目录，但与文档
+  声明的策略不一致）。浏览器上传本来就只发送 basename，不受影响。
+
+### 2. 新功能：移动文件/文件夹到文件夹 / Move entry into a folder
+
+- `manage.c` 新增 `/move.cgi`，POST form-urlencoded（或 GET query）接收
+  `name` 与 `to`，JSON 响应风格与 list/mkdir/delete 一致：
+  `{"ok":true,"name":"...","to":"..."}`。
+- `name`/`to` 都过 `valid_folder_name()` + `is_program_file()`：basename、
+  拒 `/` `\`、`..`、前导点与程序文件、严格 UTF-8、≤200 字节；中文名可用。
+- `lstat()` 确认 `to` 是真实目录且不是软链，`name` 也拒绝软链/特殊文件；
+  用 `rename()` 仅做「顶层 → 一层顶层文件夹」，**不递归、不跨层、不移出
+  `TC_SHARE_DIR`**。
+- `name == to` 或目标已有同名条目 → 409（先 `lstat()` 检查，绝不覆盖用户数据）；
+  源不存在 → 404，非法名 → 400，软链/特殊文件/目标非目录 → 403，其他 → 500。
+- `install.sh` 生成的 CGI 分发器加入 `*/move.cgi)` 分支；`-C .cgi` 下自动受
+  同一份 docroot `.htpasswd` 保护，鉴权未改。
+- `manage.c` 补 `_ISOC99_SOURCE`（与 v1.0.5 的 `upload.c` 同款修复），消除
+  交叉编译下 `strtoll` 的隐式声明警告并避免 32 位整数截断。
+- `deploy/index.html` 操作列在「下载」与「删除」之间加「移动」按钮：从当前
+  `list.cgi` 结果中 `dir:true` 的条目生成下拉（排除自身），无文件夹时提示
+  「请先新建文件夹」，POST `/move.cgi` 后 `refresh()`，失败显示后端 JSON
+  `error` 文案。v1.0.5 的上传进度/`finalize()`/无 `req.timeout` 逻辑未改。
+
+### Verification / 验证
+
+- `tests/run_filename_validation_test.sh`：32 个用例覆盖中文/emoji/符号/
+  隐藏文件/200 字节边界，以及所有旧边界与畸形 UTF-8（overlong、代理区、
+  超范围、游离续字节、C0/C1/DEL）→ 全部 PASS。
+- `tests/index_ui_test.js`：原有 v1.0.5 上传速度/成功/错误路径 3 项仍 PASS；
+  新增「移动弹窗只列出其它文件夹、中文名 URL 编码、成功提示、无文件夹提示」
+  2 项 → 全部 PASS。
+- `gcc -Wall -Wextra -fsyntax-only`（原生与交叉）无警告；所有 sh 脚本
+  `sh -n` 通过；内联 JS `node --check` 通过。
+- Docker `tc_wb` 工具链静态交叉编译，`nbfile` + `objdump -p` 三重校验：
+  纯静态 earmv4 ELF、无 INTERP/DYNAMIC。`httpd` 未改动。
+- 新 SHA-256：`upload.cgi` `4582a0ca1bfe40adab27a6760d00fa78e4916307fac671ddb472efa818fd98b8`，`manage.cgi` `dca20ba7541d682293daa973ba92f0a04fdd41af7c4a5e8c393a4093d35097b6`。
+- **状态：** 仅本机构建与本地测试；本改动未真机部署，需 QA 验证后再上线。
+  **Status:** local build and tests only; NOT deployed to the real device.
+
 ## v1.0.5 — 2026-11-21 — 修复上传完成后卡死 / Fix: upload hangs after transfer
 
 User-reported bug: "no transfer speed shown, progress sticks at 100% after the

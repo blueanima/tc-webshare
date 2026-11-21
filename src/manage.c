@@ -8,6 +8,8 @@
  *                  application/x-www-form-urlencoded POST body)
  *   /delete.cgi -> remove ONE top-level file or EMPTY directory in
  *                  TC_SHARE_DIR (name from the same sources as mkdir)
+ *   /move.cgi   -> move ONE top-level file or directory into an existing
+ *                  top-level directory (name + to from form/query)
  *
  * Security rules (same strength as upload.c):
  *   - names may use ASCII [A-Za-z0-9._-] plus well-formed UTF-8 multibyte
@@ -15,6 +17,9 @@
  *     path separators (/ and \), NUL/C0/C1/DEL controls, malformed UTF-8
  *     (overlong encodings, surrogates, values above U+10FFFF) and names
  *     longer than MAX_NAME bytes are all rejected.
+ *   - move is strictly top level -> one existing top-level directory: no
+ *     recursion, no cross-level paths, no symlink targets and no overwrite
+ *     of an existing destination entry.
  *   - deletion stays in the SHARE_DIR top level: lstat() never follows
  *     symlinks, only regular files (unlink) and directories (rmdir, empty
  *     only) are accepted.  No recursion, so user data cannot be wiped.
@@ -32,6 +37,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+/* Expose C99 strtoll (the NetBSD 7.2 headers hide it under gnu89).  Without
+ * this the cross compiler warns about an implicit declaration and a 32-bit
+ * caller silently truncates CONTENT_LENGTH above 2 GiB.  Same fix as upload.c
+ * in v1.0.5. */
+#ifndef _ISOC99_SOURCE
+#define _ISOC99_SOURCE
+#endif
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -488,6 +500,102 @@ static int action_delete(void) {
     return 0;
 }
 
+/*
+ * Move exactly one top-level entry into an existing top-level directory.
+ * Both names go through the same validator as mkdir/delete, so neither can
+ * contain separators, "..", a leading dot, program-file names, controls or
+ * malformed UTF-8.  The source and the destination directory are checked
+ * with lstat(): symlinks are refused, so data can never be moved outside
+ * SHARE_DIR.  The destination entry is checked before rename() so an
+ * existing file or folder is never overwritten.  Only one level is crossed;
+ * this is not a recursive move.
+ */
+static int action_move(void) {
+    char input[MAX_BODY + 1];
+    char name[MAX_NAME + 1];
+    char to[MAX_NAME + 1];
+    char src_path[PATH_MAX];
+    char dir_path[PATH_MAX];
+    char dst_path[PATH_MAX];
+    struct stat sb;
+    const char *query = NULL;
+    const char *type = NULL;
+    int rc = 0;
+
+    type = getenv("CONTENT_TYPE");
+    if (type != NULL && strncasecmp(type, "application/x-www-form-urlencoded", 33) == 0) {
+        rc = read_body(input, sizeof(input));
+        if (rc != 0) return cgi_fail(400, "invalid request body");
+    } else {
+        query = getenv("QUERY_STRING");
+        (void)snprintf(input, sizeof(input), "%s", (query != NULL) ? query : "");
+    }
+
+    if (form_value(input, "name", name, sizeof(name)) != 0 ||
+        form_value(input, "to", to, sizeof(to)) != 0) {
+        return cgi_fail(400, "missing or malformed 'name'/'to' parameter");
+    }
+    if (!valid_folder_name(name) || is_program_file(name) ||
+        !valid_folder_name(to) || is_program_file(to)) {
+        return cgi_fail(400, "name rejected by security policy");
+    }
+    if (strcmp(name, to) == 0) {
+        return cgi_fail(409, "source and destination folder are the same");
+    }
+
+    (void)snprintf(src_path, sizeof(src_path), "%s/%s", g_share_dir, name);
+    (void)snprintf(dir_path, sizeof(dir_path), "%s/%s", g_share_dir, to);
+    (void)snprintf(dst_path, sizeof(dst_path), "%s/%s/%s", g_share_dir, to, name);
+
+    if (lstat(src_path, &sb) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) return cgi_fail(404, "source not found");
+        return cgi_fail(500, "cannot stat source");
+    }
+    if (S_ISLNK(sb.st_mode)) {
+        return cgi_fail(403, "symlinks cannot be moved");
+    }
+    if (!S_ISREG(sb.st_mode) && !S_ISDIR(sb.st_mode)) {
+        return cgi_fail(403, "unsupported file type");
+    }
+
+    if (lstat(dir_path, &sb) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) return cgi_fail(404, "destination folder not found");
+        return cgi_fail(500, "cannot stat destination folder");
+    }
+    if (S_ISLNK(sb.st_mode)) {
+        return cgi_fail(403, "symlink folders cannot be used as destination");
+    }
+    if (!S_ISDIR(sb.st_mode)) {
+        return cgi_fail(403, "destination is not a directory");
+    }
+
+    /* Never overwrite user data.  lstat() also sees a dangling symlink. */
+    if (lstat(dst_path, &sb) == 0) {
+        return cgi_fail(409, "destination already exists");
+    }
+    if (errno != ENOENT && errno != ENOTDIR) {
+        return cgi_fail(500, "cannot stat destination");
+    }
+
+    if (rename(src_path, dst_path) != 0) {
+        if (errno == EEXIST || errno == ENOTEMPTY) {
+            return cgi_fail(409, "destination already exists");
+        }
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return cgi_fail(404, "source or destination not found");
+        }
+        return cgi_fail(500, "cannot move entry");
+    }
+
+    json_header();
+    printf("{\"ok\":true,\"name\":");
+    json_string(name);
+    printf(",\"to\":");
+    json_string(to);
+    printf("}\n");
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                               */
 /* ------------------------------------------------------------------ */
@@ -514,6 +622,9 @@ int main(void) {
     }
     if (strstr(script, "delete.cgi") != NULL) {
         return action_delete();
+    }
+    if (strstr(script, "move.cgi") != NULL) {
+        return action_move();
     }
     return cgi_fail(404, "unknown management action");
 }

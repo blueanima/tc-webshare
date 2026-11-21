@@ -9,8 +9,11 @@
  * Design rules (do not violate):
  *   - The request body is read from stdin as a stream; at most 64 KiB +
  *     a small boundary-carry buffer is resident at any time.
- *   - File names are reduced to a whitelisted basename; no traversal,
- *     no absolute paths, no backslashes, no NUL/control characters.
+ *   - File names must already be basenames; no traversal, no absolute paths,
+ *     no path separators, no "..", no NUL/control bytes.  Since v1.0.6 the
+ *     remaining bytes must be printable ASCII or well-formed UTF-8, using
+ *     the SAME strict RFC 3629 validator as manage.c (Chinese/emoji names
+ *     are allowed, malformed sequences are not).
  *   - Target files are created with O_EXCL|O_NOFOLLOW; collisions get a
  *     numeric suffix. Existing files are never overwritten.
  *   - Exactly one upload at a time: an O_EXCL lockfile in the state dir.
@@ -250,8 +253,93 @@ static int parse_filename(const char *line, char *out, size_t out_size) {
     return n > 0 ? 1 : -1;
 }
 
-static int valid_filename(const char *name) {
+/* Is BYTE a UTF-8 continuation byte (0x80..0xBF)? */
+static int is_utf8_cont(unsigned char byte) {
+    return (byte & 0xc0) == 0x80;
+}
+
+/*
+ * Strict UTF-8 validation of exactly N bytes.
+ *
+ * This is a deliberate byte-for-byte mirror of valid_utf8_bytes() in
+ * src/manage.c (v1.0.4).  The two CGIs are independent static binaries, so
+ * the validator is duplicated at source level rather than shared at link
+ * time; manage.c is left untouched so its published SHA-256 does not move.
+ * Keep the two functions in sync when either policy changes.
+ *
+ * We do not merely allow bytes >= 0x80: every sequence is checked against
+ * the RFC 3629 rules so that a malformed byte string cannot smuggle an
+ * ASCII separator or a traversal component past the checks below.
+ *
+ * Rejected: stray continuations, 0xC0/0xC1 and 0xF5..0xFF lead bytes,
+ * overlong 2/3/4-byte forms, UTF-16 surrogates (U+D800..U+DFFF) and code
+ * points above U+10FFFF.  C0 controls, DEL and C1 controls (U+0080..U+009F)
+ * are rejected as well; ordinary ASCII is left for the caller to filter.
+ */
+static int valid_utf8_bytes(const char *text, size_t n) {
     size_t i = 0;
+
+    while (i < n) {
+        unsigned char c = (unsigned char)text[i];
+
+        if (c < 0x80) {
+            if (c < 0x20 || c == 0x7f) return 0;   /* NUL/C0 controls, DEL. */
+            i++;
+            continue;
+        }
+        if (c >= 0xc2 && c <= 0xdf) {              /* 2 bytes: U+0080..U+07FF. */
+            unsigned char c1 = 0;
+            if (i + 1 >= n) return 0;
+            c1 = (unsigned char)text[i + 1];
+            if (!is_utf8_cont(c1)) return 0;
+            if (c == 0xc2 && c1 <= 0x9f) return 0; /* C1 controls. */
+            i += 2;
+            continue;
+        }
+        if (c >= 0xe0 && c <= 0xef) {              /* 3 bytes: U+0800..U+FFFF. */
+            unsigned char c1 = 0;
+            unsigned char c2 = 0;
+            if (i + 2 >= n) return 0;
+            c1 = (unsigned char)text[i + 1];
+            c2 = (unsigned char)text[i + 2];
+            if (!is_utf8_cont(c1) || !is_utf8_cont(c2)) return 0;
+            if (c == 0xe0 && c1 < 0xa0) return 0;  /* Overlong encoding. */
+            if (c == 0xed && c1 > 0x9f) return 0;  /* UTF-16 surrogate. */
+            i += 3;
+            continue;
+        }
+        if (c >= 0xf0 && c <= 0xf4) {              /* 4 bytes: U+10000..U+10FFFF. */
+            unsigned char c1 = 0;
+            unsigned char c2 = 0;
+            unsigned char c3 = 0;
+            if (i + 3 >= n) return 0;
+            c1 = (unsigned char)text[i + 1];
+            c2 = (unsigned char)text[i + 2];
+            c3 = (unsigned char)text[i + 3];
+            if (!is_utf8_cont(c1) || !is_utf8_cont(c2) || !is_utf8_cont(c3)) {
+                return 0;
+            }
+            if (c == 0xf0 && c1 < 0x90) return 0;  /* Overlong encoding. */
+            if (c == 0xf4 && c1 > 0x8f) return 0;  /* Above U+10FFFF. */
+            i += 4;
+            continue;
+        }
+        return 0;   /* 0x80..0xBF stray continuation, 0xC0/0xC1, 0xF5..0xFF. */
+    }
+    return 1;
+}
+
+/*
+ * Filename policy (v1.0.6).  All pre-v1.0.6 barriers are kept: absolute
+ * paths, any path separator, ".." (as a substring, as before), the single
+ * "." name, control bytes and names over MAX_FILENAME bytes are rejected.
+ * The final UTF-8 check also admits printable ASCII (0x20-0x7E, including
+ * spaces and symbols) and well-formed multibyte characters, aligning upload
+ * names with manage.c's folder names.  Unlike folders, a leading dot is
+ * allowed so hidden files such as .gitignore can still be uploaded; only
+ * "." and ".." are forbidden.
+ */
+static int valid_filename(const char *name) {
     size_t n = 0;
 
     if (name == NULL) {
@@ -264,21 +352,16 @@ static int valid_filename(const char *name) {
     if (name[0] == '/' || name[0] == '\\') {
         return 0;               /* Absolute paths are rejected, not stripped. */
     }
-    if (strchr(name, '\\') != NULL || strstr(name, "..") != NULL) {
-        return 0;
+    if (strchr(name, '/') != NULL || strchr(name, '\\') != NULL) {
+        return 0;               /* No separators anywhere (defence in depth). */
+    }
+    if (strstr(name, "..") != NULL) {
+        return 0;               /* Unchanged from v1.0.5: any ".." substring. */
     }
     if (strcmp(name, ".") == 0) {
         return 0;
     }
-    for (i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)name[i];
-        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                 (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
-        if (!ok) {
-            return 0;           /* Whitelist also rejects NUL/control bytes. */
-        }
-    }
-    return 1;
+    return valid_utf8_bytes(name, n);
 }
 
 /* ------------------------------------------------------------------ */
@@ -655,8 +738,15 @@ int main(void) {
         }
 
         if (have_file) {
-            const char *base = strrchr(raw_name, '/');
-            base = (base != NULL) ? base + 1 : raw_name;
+            const char *base = raw_name;
+            /* Reject traversal in the RAW header value before reducing it to
+             * a basename: previously "../evil.txt" was silently accepted as
+             * "evil.txt" (safe but inconsistent with the documented policy).
+             * Legitimate browsers only ever send a basename here. */
+            if (strchr(raw_name, '/') != NULL || strchr(raw_name, '\\') != NULL ||
+                strstr(raw_name, "..") != NULL) {
+                return cgi_fail(400, "filename rejected by security policy");
+            }
             if (!valid_filename(base)) {
                 return cgi_fail(400, "filename rejected by security policy");
             }

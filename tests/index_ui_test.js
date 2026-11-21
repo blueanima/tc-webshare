@@ -24,14 +24,16 @@ assert(matched, 'inline <script> not found in deploy/index.html');
 
 let clock = 1000;
 const elements = {};
+const created = [];
 const ids = [
   'status', 'rows', 'file', 'folder', 'uploadBtn', 'progressWrap',
-  'progressFill', 'progressText', 'refreshBtn', 'mkdirBtn'
+  'progressFill', 'progressText', 'refreshBtn', 'mkdirBtn',
+  'moveModal', 'moveInfo', 'moveTarget', 'moveConfirm', 'moveCancel'
 ];
 for (const id of ids) {
   elements[id] = {
     id: id,
-    hidden: id === 'progressWrap',
+    hidden: id === 'progressWrap' || id === 'moveModal',
     disabled: false,
     value: '',
     textContent: '',
@@ -39,6 +41,9 @@ for (const id of ids) {
     className: '',
     style: {},
     files: [],
+    children: [],
+    appendChild(child) { this.children.push(child); },
+    focus() {},
     onclick: null
   };
 }
@@ -67,7 +72,15 @@ class FakeFormData {
 const sandbox = {
   document: {
     getElementById: (id) => elements[id] || null,
-    createElement: () => ({ style: {}, appendChild() {}, setAttribute() {} })
+    createElement: (tag) => {
+      const el = {
+        tag: tag, style: {}, children: [], textContent: '', value: '',
+        appendChild(child) { this.children.push(child); },
+        setAttribute() {}
+      };
+      created.push(el);
+      return el;
+    }
   },
   window: {
     performance: { now: () => clock },
@@ -138,5 +151,62 @@ up2.onreadystatechange();
 assert(elements.status.textContent.indexOf('网络错误') !== -1,
        'late onreadystatechange overwrote error state');
 console.log('3. error/robustness     : OK (' + elements.status.textContent + ')');
+
+/* --- 4. move-to-folder UI -------------------------------------------- */
+function feedList(entries) {
+  const list = xhrs.filter((x) => x.url === '/list.cgi').pop();
+  list.readyState = 4;
+  list.status = 200;
+  list.responseText = JSON.stringify(entries);
+  list.onreadystatechange();
+}
+function clickMoveFor(name) {
+  const match = created.filter((el) => el.tag === 'button' && el.textContent === '移动');
+  assert(match.length > 0, 'no 移动 button rendered');
+  /* The button is rendered after its name cell; use the last rendered row
+   * whose move title matches the entry we want by driving the entry list in
+   * a known order and picking the corresponding button index. */
+  const index = entriesUnderTest.findIndex((e) => e.name === name);
+  assert(index >= 0, 'entry under test not found: ' + name);
+  match[index].onclick();
+}
+let entriesUnderTest = [
+  {name: '家庭照片', size: 0, mtime: '2026-11-21T00:00:00Z', dir: true},
+  {name: '临时', size: 0, mtime: '2026-11-21T00:00:00Z', dir: true},
+  {name: 'report.docx', size: 10, mtime: '2026-11-21T00:00:00Z', dir: false}
+];
+created.length = 0;
+feedList(entriesUnderTest);
+clickMoveFor('家庭照片');
+assert.strictEqual(elements.moveModal.hidden, false, 'move modal not shown');
+assert.deepStrictEqual(elements.moveTarget.children.map((o) => o.value), ['临时'],
+                       'target list must exclude the source folder');
+elements.moveTarget.value = '临时';
+elements.moveConfirm.onclick();
+const mvXhr = xhrs.filter((x) => x.url === '/move.cgi').pop();
+assert(mvXhr, 'no /move.cgi request created');
+assert.strictEqual(mvXhr.method, 'POST');
+assert(mvXhr.body.indexOf('name=' + encodeURIComponent('家庭照片')) === 0,
+       'source name not url-encoded in move request: ' + mvXhr.body);
+assert(mvXhr.body.indexOf('&to=' + encodeURIComponent('临时')) !== -1,
+       'target name not url-encoded in move request: ' + mvXhr.body);
+assert.strictEqual(elements.moveModal.hidden, true, 'move modal not closed on confirm');
+mvXhr.readyState = 4;
+mvXhr.status = 200;
+mvXhr.responseText = '{"ok":true,"name":"家庭照片","to":"临时"}\n';
+mvXhr.onreadystatechange();
+assert(elements.status.textContent.indexOf('已移动：家庭照片 → 临时') === 0,
+       'move success status missing: ' + elements.status.textContent);
+console.log('4. move UI              : OK (' + elements.status.textContent + ')');
+
+/* No subfolder at all: show a friendly hint, never an empty dropdown. */
+entriesUnderTest = [{name: 'only-file.txt', size: 1, mtime: '2026-11-21T00:00:00Z', dir: false}];
+created.length = 0;
+feedList(entriesUnderTest);
+clickMoveFor('only-file.txt');
+assert.strictEqual(elements.moveModal.hidden, true, 'modal opened with no folders');
+assert(elements.status.textContent.indexOf('请先新建文件夹') !== -1,
+       'missing hint when no folder exists');
+console.log('5. move empty folders   : OK (' + elements.status.textContent + ')');
 
 console.log('ALL UI TESTS PASSED');
