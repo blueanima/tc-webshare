@@ -188,7 +188,7 @@ port_listening() {
                     ;;
             esac
         done
-        return "${found}"
+        exit "${found}"
     )
 }
 
