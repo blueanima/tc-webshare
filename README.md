@@ -82,7 +82,7 @@ The management homepage is a **program file**: its master copy lives in managed 
 │   ├── env.sh                 cross env; TOOLCHAIN_DIR/SYSROOT/SRC_ROOT overrides, CC includes --sysroot
 │   ├── fetch_src.sh           idempotent NetBSD source download/unpack; reuses /wb-build/src
 │   └── build_thttpd.sh        historical name; builds httpd + upload.cgi + manage.cgi
-├── src/upload.c               streaming multipart upload CGI (unchanged)
+├── src/upload.c               streaming multipart upload CGI (v1.0.5: no post-body stdin drain)
 ├── src/manage.c               list/mkdir/delete CGI (static, JSON, strict UTF-8 basename whitelist)
 ├── deploy/
 │   ├── common.sh              dependency-light on-device helpers
@@ -91,7 +91,11 @@ The management homepage is a **program file**: its master copy lives in managed 
 │   ├── index.html             management homepage template (program file)
 │   ├── htpasswd.example       placeholder only
 │   └── thttpd.conf            historical, informational only
-└── docs/device-layout.md      on-device layout and ownership
+├── docs/device-layout.md      on-device layout and ownership
+└── tests/                     local-only proof of the v1.0.5 upload fix
+    ├── cgi_response_repro.c   mirrors bozohttpd's socketpair CGI topology
+    ├── run_upload_response_test.sh  proves bug on pre-fix CGI, PASS on current
+    └── index_ui_test.js       headless DOM/XHR test of the upload progress UI
 ```
 
 ### 5. Build (local / Docker, no hardware involved)
@@ -185,7 +189,13 @@ curl -u admin:'<password>' -H 'Expect:' -F 'file=@/path/to/test.txt' \
 # Failed when curl sends the default "Expect: 100-continue".
 ```
 
-#### Web management UI (v1.0.4)
+**v1.0.5:** the upload response now ends immediately after the multipart body
+is saved. If an older `upload.cgi` is still installed, the command above can
+hang until `--max-time` even though `upload.log` says `status=OK`, and it
+leaves `upload.lock` behind. Replace `upload.cgi` with the v1.0.5 binary before
+repeating the test.
+
+#### Web management UI (v1.0.5)
 
 Open `http://<device-lan-ip>:8080/` in a browser and pass the Basic auth
 dialog. The hidden management homepage is served automatically; the top
@@ -196,7 +206,11 @@ rendered from `/list.cgi` (JSON) without any CDN.
 
 All selected files are posted in one multipart request; the progress bar
 therefore reports the **whole batch** (`req.upload.onprogress`), and the
-upload button is disabled until the response arrives.
+upload button is disabled until the response arrives. The label shows both
+percentage and a smoothed live speed (e.g. `45% · 2.3 MB/s`); the completion
+message appends the batch's average speed. Success, network error and a
+synchronous `send()` failure all hide the bar and re-enable the button. No
+`req.timeout` is set, so a slow multi-gigabyte upload is never cut off early.
 
 Endpoints (all behind the same docroot `.htpasswd`):
 
@@ -232,6 +246,8 @@ Responses: `200 {"ok":true,...}`, `400` bad name, `403` symlink/special file,
 - [ ] `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/` → 401
 - [ ] authenticated GET / → 200 with a directory index, no `.htpasswd` listed
 - [ ] POST to `/upload.cgi` → 200 and the file lands in the **resolved** share dir
+- [ ] upload returns **immediately** after the file lands (no `--max-time` timeout); `state/upload.lock` is gone and no `upload.cgi` process remains
+- [ ] web UI shows a live speed next to the percentage and auto-hides/refreshes on completion
 - [ ] duplicate filenames get `.1` suffixes; bad filenames get 400
 - [ ] `boot.sh` contains exactly one marker block, before the `starting native manager` echo, `|| true` wrapped; Samba still starts
 - [ ] `state/boot.nonweb` matches the non-marker lines of boot.sh
@@ -251,7 +267,7 @@ Removes the marker block, verifies boot.sh against the install-time snapshot, st
 
 Plaintext HTTP on a trusted wired LAN only; TLS is out of scope. `upload.c` whitelists `[A-Za-z0-9._-]` basenames, uses `O_EXCL|O_NOFOLLOW`, never overwrites, and serialises uploads with `upload.lock`. `manage.c` applies strict RFC 3629 UTF-8 validation to mkdir/delete names (valid Chinese names are allowed; malformed sequences, controls, separators, `..`, leading dots and >200-byte names are refused), and deletion is limited to a validated top-level basename: `lstat()` rejects symlinks, `rmdir()` refuses non-empty directories, no recursion is performed, and program/dotfiles are unreachable by name. Deletions are permanent. Credentials are supplied as a pre-computed crypt(3) hash; `htpasswd.example` is a placeholder. No plaintext password or credential file is read by this repository.
 
-**v1.0.4 status:** built and tested locally only; not yet deployed to the real device. v1.0.3 remains the version validated on hardware (see below).
+**v1.0.5 status:** built locally and validated with a simulated-CGI harness plus a headless UI test; **not yet deployed to the real device** — QA verification is required. The hardware-validated baseline remains v1.0.3 (see below); v1.0.4 added the management UI but had the upload-hang bug fixed in v1.0.5. New `upload.cgi` SHA-256: `04e35d26f7d25d86307f702f1f26a6343c9bb9e471cf5d2fadc648647c0a2cbd`.
 
 ### 10. License
 
@@ -327,7 +343,7 @@ GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSM
 
 ### 4. 文件树
 
-（同英文版，新增 `deploy/common.sh`；`deploy/thttpd.conf` 仅为历史说明文件。）
+（同英文版，新增 `deploy/common.sh`；`deploy/thttpd.conf` 仅为历史说明文件；`tests/` 为纯本地验证脚本，不参与设备部署。）
 
 ### 5. 构建（本机/Docker，不碰真机）
 
@@ -370,11 +386,13 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 
 **Flash 是同步写入、极慢**：用 `cp` 写 656KB 的 `httpd` 曾耗时约 20 分钟并导致设备失联；安装脚本已改用 `dd bs=64k`，真机实测约 30 秒。boot.sh 的临时文件放在 16MB RAM tmpfs，绝不写 Flash。上传测试必须带 `-H 'Expect:'`，否则 bozohttpd 会因默认 `Expect: 100-continue` 返回 417。
 
-#### 网页管理界面（v1.0.4）
+#### 网页管理界面（v1.0.5）
 
 浏览器打开 `http://<设备IP>:8080/` 并通过 Basic auth 后，会自动看到隐藏的管理首页：顶部工具栏提供**多文件上传**（带实时进度条）、**新建文件夹**、刷新；下方表格显示顶层文件名、大小、UTC 修改时间、下载链接、**删除**按钮与目录标记，由 `/list.cgi`（JSON）渲染，完全离线、无外部 CDN。
 
-所选多个文件仍一次性 POST，因此进度条显示**整批**上传进度（`req.upload.onprogress`），上传期间禁用上传按钮，完成或失败后自动隐藏。
+所选多个文件仍一次性 POST，因此进度条显示**整批**上传进度（`req.upload.onprogress`），上传期间禁用上传按钮。v1.0.5 起进度文字同时显示百分比与**平滑后的实时速度**（如 `45% · 2.3 MB/s`），完成消息附上整批平均速度；成功、网络错误与 `send()` 同步异常都会隐藏进度条并恢复按钮。故意不设 `req.timeout`，避免慢速网络上的大文件被误判超时。
+
+**v1.0.5 修复的卡死**：旧版 `upload.c` 在解析完 multipart 后又去把 stdin 读到 EOF。bozohttpd 把同一个 AF_UNIX socketpair 同时作为 CGI 的 stdin/stdout，输出转发子进程一直持有对端，stdin 在 CGI 退出前永远不会有 EOF——于是 CGI 卡住、不发响应、浏览器停在 100% 且要手动刷新，客户端超时后还会残留 `upload.lock`。本版已移除该读取并补齐 `Status: 200 OK` 与 `fflush(stdout)`。本地可用 `tests/run_upload_response_test.sh` 复现旧版卡死并验证新版立即返回、进程干净退出、锁被释放。
 
 接口（均受 docroot 同一份 `.htpasswd` 保护）：
 
@@ -393,7 +411,7 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 
 见英文版对应章节：重点确认 8080 LISTEN、401 认证、`/upload.cgi` 上传落点（curl 必须加 `-H 'Expect:'`）、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、开机后 boot hook 通过 acp 重新挂载硬盘并继续使用 `/Volumes/dk2/share/web`（失败时明确告警并回退 Flash 小容量数据目录）、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；`manage.c` 对新建/删除名称执行严格 RFC 3629 UTF-8 校验（合法中文放行，畸形序列、控制字符、分隔符、`..`、前导点、超 200 字节拒绝）；删除仅限合法顶层 basename：`lstat()` 拒绝软链、`rmdir()` 拒绝非空目录、不递归、程序文件与点文件不可命名，且删除不可撤销。GPL-3.0-or-later。
 
-**v1.0.4 状态**：仅在本机构建与测试，**尚未真机部署**；硬件上已验证的版本仍是 v1.0.3（见下）。
+**v1.0.5 状态**：已在本机构建，并用模拟 CGI 拓扑的本地测试与无头 UI 测试验证；**尚未真机部署**，需 QA 验证后再上线。硬件上已验证的版本仍是 v1.0.3（见下）。新 `upload.cgi` SHA-256：`04e35d26f7d25d86307f702f1f26a6343c9bb9e471cf5d2fadc648647c0a2cbd`。
 
 ### 11. 发布说明 — 真机验证结果（v1.0.2）
 

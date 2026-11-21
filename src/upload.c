@@ -20,6 +20,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+/* Expose C99 declarations (notably strtoll).  Without this the NetBSD 7.2
+ * headers hide strtoll under the plain gnu89 default, the cross compiler
+ * warns about an implicit declaration, and a 32-bit caller silently truncates
+ * CONTENT_LENGTH above 2 GiB back to int. */
+#ifndef _ISOC99_SOURCE
+#define _ISOC99_SOURCE
+#endif
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -132,11 +139,15 @@ static const char *status_text(int code) {
     }
 }
 
-/* CGI failures must still exit 0 so the server honours our Status header. */
+/* CGI failures must still exit 0 so the server honours our Status header.
+ * Flush explicitly: bozohttpd's output-forwarding child only sees EOF (and
+ * therefore only finishes the HTTP response) once this process exits, so the
+ * bytes must be pushed out before we return. */
 static int cgi_fail(int code, const char *reason) {
     printf("Status: %d %s\r\n", code, status_text(code));
     printf("Content-Type: text/plain; charset=utf-8\r\n\r\n");
     printf("ERROR: %s\r\n", reason);
+    (void)fflush(stdout);
     log_event("ERROR", g_written, reason);
     return 0;
 }
@@ -499,33 +510,24 @@ static int safe_open(const char *dir, const char *name, char *out_path,
     return -1;
 }
 
-static void drain_stdin(io_t *io) {
-    unsigned char scratch[4096];
-
-    for (;;) {
-        if (io->pos < io->len) {
-            io->pos = io->len;
-            continue;
-        }
-        if (io->eof) {
-            break;
-        }
-        {
-            ssize_t n = read(STDIN_FILENO, scratch, sizeof(scratch));
-            if (n > 0) {
-                continue;
-            }
-            if (n == 0) {
-                io->eof = 1;
-                break;
-            }
-            if (errno == EINTR) {
-                continue;
-            }
-            break;
-        }
-    }
-}
+/*
+ * NOTE (v1.0.5 bugfix): there is deliberately NO "drain stdin to EOF" step.
+ *
+ * bozohttpd's cgi-bozo.c hands a CGI ONE AF_UNIX socketpair as both stdin and
+ * stdout (dup2(sv[1], 0) and dup2(sv[1], 1)).  The parent writes the request
+ * body into sv[0] and exits; a separate output-forwarding child keeps sv[0]
+ * open and reads our response from it until EOF.  Consequently stdin can
+ * never report EOF until THIS process exits.  A read-to-EOF loop placed
+ * before the response (the old drain_stdin()) is a circular wait:
+ *
+ *     CGI waits for stdin EOF  ->  forwarder waits for CGI stdout bytes
+ *     ->  neither happens  ->  client times out, CGI is stuck, lock leaks.
+ *
+ * The multipart parser already consumed every body byte through the closing
+ * boundary, so there is nothing left to drain.  Any non-standard trailing
+ * bytes are simply discarded with the socketpair when we exit.  Do not
+ * reintroduce a blocking stdin read here.  See CHANGELOG v1.0.5.
+ */
 
 /* ------------------------------------------------------------------ */
 /* main                                                                */
@@ -568,6 +570,11 @@ int main(void) {
     (void)signal(SIGINT, on_fatal_signal);
     (void)signal(SIGTERM, on_fatal_signal);
     (void)signal(SIGHUP, on_fatal_signal);
+    /* A client that disconnects mid-upload makes a later write to stdout
+     * raise SIGPIPE.  Route it through the same handler so the O_EXCL lock is
+     * released instead of being left behind by a default-action termination
+     * (atexit handlers do NOT run on SIGPIPE). */
+    (void)signal(SIGPIPE, on_fatal_signal);
     (void)atexit(cleanup_lock);
 
     content_length_text = getenv("CONTENT_LENGTH");
@@ -689,10 +696,16 @@ int main(void) {
     }
 
     (void)content_length;         /* Kept for diagnostics and future limits. */
-    drain_stdin(&io);
 
+    /* Emit a complete CGI response immediately (see the note above: reading
+     * stdin to EOF here would deadlock against bozohttpd).  Status: 200 matches
+     * cgi_fail()'s explicit status line; fflush() pushes the bytes out before
+     * we return, and cleanup_lock()/atexit() release the O_EXCL lock on the
+     * normal exit path that the forwarder is waiting for. */
+    printf("Status: 200 OK\r\n");
     printf("Content-Type: text/plain; charset=utf-8\r\n\r\n");
     printf("OK files=%d bytes=%lld\r\n", saved_files, (long long)g_written);
+    (void)fflush(stdout);
     cleanup_lock();
     return 0;
 }

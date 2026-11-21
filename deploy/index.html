@@ -38,7 +38,7 @@ a{color:var(--accent);text-decoration:none}
 .progress{display:flex;align-items:center;gap:10px;margin-top:10px}
 .progress-track{flex:1;max-width:420px;height:10px;background:#e4e7ec;border-radius:999px;overflow:hidden}
 .progress-fill{height:100%;width:0;background:var(--accent);transition:width .12s linear}
-.progress-text{font-size:12px;color:var(--muted);min-width:38px}
+.progress-text{font-size:12px;color:var(--muted);min-width:118px;white-space:nowrap;font-variant-numeric:tabular-nums}
 button.mini{padding:4px 9px;font-size:12px;margin-left:10px}
 button.danger{background:var(--danger)}
 </style>
@@ -97,11 +97,45 @@ button.danger{background:var(--danger)}
   var progressFill = document.getElementById('progressFill');
   var progressText = document.getElementById('progressText');
 
-  function showProgress(pct) {
+  /* v1.0.5: XHR onprogress fires in bursts, so sample at most ~8x/second and
+   * smooth with an exponential moving average to keep the speed readable. */
+  var SPEED_SAMPLE_MS = 120;
+  var SPEED_SMOOTH = 0.35;
+  var speedLastLoaded = 0;
+  var speedLastTime = 0;
+  var speedStart = 0;
+  var speedSeen = 0;
+  var speedValue = 0;
+  var batchBytes = 0;
+
+  function nowMs() {
+    return (window.performance && typeof performance.now === 'function')
+      ? performance.now() : Date.now();
+  }
+
+  function formatSpeed(bytesPerSec) {
+    var v = Number(bytesPerSec) || 0;
+    if (v < 1) return '--';
+    if (v < 1024) return v.toFixed(0) + ' B/s';
+    if (v < 1024 * 1024) return (v / 1024).toFixed(1) + ' KB/s';
+    return (v / (1024 * 1024)).toFixed(1) + ' MB/s';
+  }
+
+  function resetSpeed() {
+    var t = nowMs();
+    speedLastLoaded = 0;
+    speedLastTime = t;
+    speedStart = t;
+    speedSeen = t;
+    speedValue = 0;
+    batchBytes = 0;
+  }
+
+  function showProgress(pct, speed) {
     var value = Math.max(0, Math.min(100, Math.round(pct)));
     progressWrap.hidden = false;
     progressFill.style.width = value + '%';
-    progressText.textContent = value + '%';
+    progressText.textContent = value + '%' + (speed ? ' · ' + speed : '');
   }
 
   function hideProgress() {
@@ -230,25 +264,78 @@ button.danger{background:var(--danger)}
     /* All selected files go into one POST, so one progress bar reports the
      * progress of the whole batch (accurate and no extra requests). */
     var fd = new FormData();
-    for (var i = 0; i < fileEl.files.length; i++) fd.append('file', fileEl.files[i]);
+    var finished = false;
+    resetSpeed();
+    for (var i = 0; i < fileEl.files.length; i++) {
+      fd.append('file', fileEl.files[i]);
+      batchBytes += fileEl.files[i].size;
+    }
     var req = new XMLHttpRequest();
     req.open('POST', '/upload.cgi', true);
+
+    /* Single exit point: idempotent so onreadystatechange / onerror / a
+     * synchronous send() failure cannot double-notify or leave the bar up. */
+    function finalize(ok, message, isError) {
+      if (finished) return;
+      finished = true;
+      hideProgress();
+      uploadBtn.disabled = false;
+      /* refresh() clears the status line, so set ours AFTER it. */
+      if (ok) { fileEl.value = ''; refresh(); }
+      status(message, isError);
+    }
+
     /* Must be set after open() and before send(): progress is for the
      * request body, i.e. the complete multipart batch. */
     req.upload.onprogress = function (e) {
-      if (e.lengthComputable && e.total > 0) showProgress(e.loaded / e.total * 100);
+      if (finished) return;
+      var t = nowMs();
+      speedSeen = t;
+      if (!e.lengthComputable || !(e.total > 0)) return;
+      var elapsed = t - speedLastTime;
+      if (elapsed >= SPEED_SAMPLE_MS) {
+        var delta = e.loaded - speedLastLoaded;
+        if (delta >= 0 && elapsed > 0) {
+          var instant = delta * 1000 / elapsed;
+          speedValue = speedValue > 0
+            ? speedValue * (1 - SPEED_SMOOTH) + instant * SPEED_SMOOTH
+            : instant;
+        }
+        speedLastLoaded = e.loaded;
+        speedLastTime = t;
+      }
+      showProgress(e.loaded / e.total * 100, formatSpeed(speedValue));
     };
+
     req.onreadystatechange = function () {
-      if (req.readyState !== 4) return;
-      hideProgress();
-      uploadBtn.disabled = false;
-      if (req.status === 200) { status('上传完成：' + req.responseText); fileEl.value = ''; refresh(); }
-      else { status('上传失败：HTTP ' + req.status + ' ' + req.responseText, true); }
+      if (req.readyState !== 4 || finished) return;
+      if (req.status === 200) {
+        var secs = (speedSeen - speedStart) / 1000;
+        var avg = (secs > 0 && batchBytes > 0) ? batchBytes / secs : 0;
+        var suffix = avg > 0 ? ' · 平均 ' + formatSpeed(avg) : '';
+        finalize(true, '上传完成：' + String(req.responseText).trim() + suffix, false);
+      } else if (req.status === 401) {
+        finalize(false, '会话认证已失效，请重新输入用户名/口令。', true);
+      } else {
+        finalize(false, '上传失败：HTTP ' + req.status + ' ' + req.responseText, true);
+      }
     };
+
+    /* Deliberately NO req.timeout: large backups over a slow LAN can take
+     * minutes, and a fixed deadline would report false failures.  onerror
+     * covers aborts, network loss and the server closing the connection. */
+    req.onerror = function () {
+      finalize(false, '上传失败：网络错误，请检查连接后重试', true);
+    };
+
     uploadBtn.disabled = true;
-    showProgress(0);
+    showProgress(0, '');
     status('正在上传…');
-    req.send(fd);
+    try {
+      req.send(fd);
+    } catch (err) {
+      finalize(false, '上传失败：' + err.message, true);
+    }
   };
 
   refresh();

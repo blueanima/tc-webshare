@@ -1,5 +1,92 @@
 # Changelog / 变更记录
 
+## v1.0.5 — 2026-11-21 — 修复上传完成后卡死 / Fix: upload hangs after transfer
+
+User-reported bug: "no transfer speed shown, progress sticks at 100% after the
+upload, must refresh the page manually." The file did land on disk
+(`upload.log` recorded `status=OK`), but the HTTP response never finished.
+用户反馈："没有显示上传速度，传完后卡 100%，要手动刷新"。文件其实已落盘（`upload.log`
+记录了 `status=OK`），但 HTTP 响应一直没有结束。
+
+### Root cause / 根因
+
+`src/upload.c` called `drain_stdin()` on the success path after the multipart
+body had already been fully parsed. bozohttpd's `cgi-bozo.c` gives a CGI **one
+`AF_UNIX` socketpair as both stdin and stdout** (`dup2(sv[1], 0)` and
+`dup2(sv[1], 1)`). The input parent writes `CONTENT_LENGTH` bytes to `sv[0]`
+and exits, while a separate output-forwarding child **keeps `sv[0]` open** and
+reads the CGI response until EOF (`finish_cgi_output()`). Therefore stdin on
+the CGI side can never report EOF until the CGI itself exits:
+
+```
+CGI blocks reading stdin to EOF
+  -> never writes its HTTP response
+  -> forwarder never sees EOF, never replies to the browser
+  -> browser XHR readyState 4 never arrives (stuck at 100%)
+  -> client times out; CGI killed; atexit() never runs; upload.lock leaks
+```
+
+This was reproduced empirically with a native harness that mirrors the
+socketpair topology: the pre-fix CGI timed out with the process still alive,
+no response bytes forwarded, and `upload.lock` left behind.
+`src/upload.c` 成功路径在 multipart 已解析完之后又调用 `drain_stdin()` 试图把 stdin 读到
+EOF。bozohttpd 的 `cgi-bozo.c` 给 CGI 的是**同一个 `AF_UNIX` socketpair 同时充当 stdin 与
+stdout**，输入父进程写完 `CONTENT_LENGTH` 字节就退出，但另一个输出转发子进程**一直持有
+`sv[0]`**，要读到 CGI 响应 EOF 才结束。因此 CGI 侧的 stdin 在自身退出前永远不会有 EOF：
+CGI 卡在读 stdin → 不写响应 → 转发子进程等不到 EOF → 浏览器 `readyState 4` 永远不来
+（卡 100%）→ 客户端超时、进程被杀、`atexit()` 不执行、`upload.lock` 残留。已用复刻该
+socketpair 拓扑的本地原生测试实证复现。
+
+### Fixes / 修复
+
+- **Removed `drain_stdin()` entirely.** The parser already consumes every body
+  byte through the closing boundary; reading further was both unnecessary and
+  a circular wait. A comment in `upload.c` documents why it must not return.
+- **Success path now emits `Status: 200 OK`** (matching `cgi_fail()`), plus an
+  explicit `fflush(stdout)` so the forwarder receives the complete response
+  before `main()` returns. `cleanup_lock()` runs on the normal exit path, so
+  no `upload.lock` is left behind.
+- **`SIGPIPE` now routes through `on_fatal_signal()`** so a client disconnect
+  also releases the O_EXCL lock (default SIGPIPE termination skips `atexit`).
+- **Added `_ISOC99_SOURCE`** so the NetBSD 7.2 headers expose `strtoll`; this
+  removes a pre-existing cross-compiler warning and prevents a 32-bit implicit
+  `int` return from truncating `CONTENT_LENGTH` above 2 GiB.
+- **Web UI shows transfer speed.** `onprogress` samples at most ~8×/s and
+  smooths with an EMA; the label reads e.g. `45% · 2.3 MB/s`. A final average
+  speed is appended to the completion message, and the status line is now set
+  *after* `refresh()` so it is no longer cleared immediately.
+- **Completion/failure handling hardened.** One idempotent `finalize()`
+  covers `readyState 4`, `onerror` and a synchronous `send()` exception:
+  it always hides the bar and re-enables the button. No `req.timeout` is set
+  deliberately — large backups over a slow LAN can take minutes and a fixed
+  deadline would report false failures.
+- **删除了 `drain_stdin()`**（解析器已读到结束边界，再读就是循环等待，注释已写明禁止恢复）；
+  成功响应补 `Status: 200 OK` 与 `fflush(stdout)`，正常退出时释放 `upload.lock`；
+  `SIGPIPE` 走清理处理；补 `_ISOC99_SOURCE` 消除 `strtoll` 警告并避免 2 GiB 截断；
+  进度条显示平滑速度、完成态显示平均速度，`finalize()` 统一处理成功/网络错误，
+  故意不设 `req.timeout` 以免大文件误超时。
+
+### Verification / 验证
+
+- `gcc -Wall -Wextra -fsyntax-only src/upload.c`: no warnings (native and
+  cross with `-Werror`); `node --check` on the inline JS: passed;
+  `sh -n` on all shell scripts: passed.
+- `tests/run_upload_response_test.sh`: pre-fix CGI → `BUG_REPRODUCED`
+  (timeout, process alive, lock leaked); current CGI → `PASS` (response with
+  `Status: 200 OK`, process exited, lock released, file intact).
+- `tests/index_ui_test.js`: headless DOM/XHR test of the real inline script —
+  speed text `100% · 5.0 MB/s`, success hides bar + refreshes + keeps message,
+  network error also hides bar and re-enables the button.
+- Cross-built in Docker (`tc_wb`, `armv4--netbsdelf-eabi-gcc --sysroot=...`,
+  `-static -fno-pic -fno-PIE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE`);
+  all three binaries verified by `nbfile` (static ARM ELF) and `objdump -p`
+  (no `INTERP`/`DYNAMIC`). `httpd` and `manage.cgi` hashes are unchanged.
+- New `upload.cgi` SHA-256:
+  `04e35d26f7d25d86307f702f1f26a6343c9bb9e471cf5d2fadc648647c0a2cbd`.
+- **Status:** local build + simulated-CGI tests only; NOT deployed to the real
+  device by this change. QA validation required before deployment.
+  **状态：** 仅本地构建与模拟 CGI 测试，本改动未真机部署；需 QA 验证后再上线。
+
 ## v1.0.4 — 2026-11-21 — 中文名、上传进度、删除 / Chinese names, upload progress, delete
 
 Based on hands-on browser feedback: Chinese folder names were rejected, uploads
