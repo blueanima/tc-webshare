@@ -92,6 +92,9 @@ The management homepage is a **program file**: its master copy lives in managed 
 │   ├── htpasswd.example       placeholder only
 │   └── thttpd.conf            historical, informational only
 ├── docs/device-layout.md      on-device layout and ownership
+├── docs/screenshots/          real-device UI screenshots (see its README)
+│   ├── README.md              screenshot index and captions
+│   └── web-ui-v1.0.6.png      management UI on the device
 └── tests/                     local-only proof of the v1.0.5/v1.0.6 fixes
     ├── cgi_response_repro.c   mirrors bozohttpd's socketpair CGI topology
     ├── run_upload_response_test.sh  proves bug on pre-fix CGI, PASS on current
@@ -205,6 +208,10 @@ leaves `upload.lock` behind. Replace `upload.cgi` with the v1.0.5 binary before
 repeating the test.
 
 #### Web management UI (v1.0.5)
+
+![tc-webshare management UI (v1.0.6, real device)](docs/screenshots/web-ui-v1.0.6.png)
+
+*(Screenshot captured on the device at v1.0.6; see [docs/screenshots/README.md](docs/screenshots/README.md).)*
 
 Open `http://<device-lan-ip>:8080/` in a browser and pass the Basic auth
 dialog. The hidden management homepage is served automatically; the top
@@ -385,7 +392,7 @@ GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSM
 
 ### 4. 文件树
 
-（同英文版，新增 `deploy/common.sh`；`deploy/thttpd.conf` 仅为历史说明文件；`tests/` 为纯本地验证脚本，不参与设备部署。）
+（同英文版，新增 `deploy/common.sh`；`deploy/thttpd.conf` 仅为历史说明文件；`tests/` 为纯本地验证脚本，不参与设备部署；`docs/screenshots/` 存放真机管理界面截图，见该目录 README 与上文界面章节。）
 
 ### 5. 构建（本机/Docker，不碰真机）
 
@@ -429,6 +436,10 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 **Flash 是同步写入、极慢**：用 `cp` 写 656KB 的 `httpd` 曾耗时约 20 分钟并导致设备失联；安装脚本已改用 `dd bs=64k`，真机实测约 30 秒。boot.sh 的临时文件放在 16MB RAM tmpfs，绝不写 Flash。上传测试必须带 `-H 'Expect:'`，否则 bozohttpd 会因默认 `Expect: 100-continue` 返回 417。
 
 #### 网页管理界面（v1.0.5）
+
+![tc-webshare 网页管理界面（v1.0.6，真机实测）](docs/screenshots/web-ui-v1.0.6.png)
+
+*（截图为真机 v1.0.6 版本所摄；说明见 [docs/screenshots/README.md](docs/screenshots/README.md)。）*
 
 浏览器打开 `http://<设备IP>:8080/` 并通过 Basic auth 后，会自动看到隐藏的管理首页：顶部工具栏提供**多文件上传**（带实时进度条）、**新建文件夹**、刷新；下方表格显示顶层文件名、大小、UTC 修改时间、下载链接、**移动**按钮、**删除**按钮与目录标记，由 `/list.cgi`（JSON）渲染，完全离线、无外部 CDN。点击「移动」会从当前列表的文件夹中选择目标（排除自身），确认后调用 `/move.cgi`；若还没有任何文件夹，会提示「请先新建文件夹」。
 
