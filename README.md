@@ -49,14 +49,19 @@ Performance figures from the earlier design (15–25 MB/s downloads, 8–15 MB/s
 
 ```
 Browser (LAN) --HTTP :8080--> bozohttpd (static ELF, slashdir=<SHARE_DIR>)
-                               |-- GET /                    -> .htpasswd 401 / index / download
-                               `-- POST /upload.cgi (-C .cgi -> <WEB_ROOT>/bin/upload_shim)
-                                                               -> static upload.bin
-                                                               -> upload.lock (O_EXCL, concurrency=1)
-                                                               -> <SHARE_DIR>/<basename>
+                               |-- GET /                    -> hidden management homepage (-x)
+                               |                               -> .htpasswd 401 / download links
+                               `-- POST|GET /<action>.cgi (-C .cgi -> Flash cgi_dispatch.sh)
+                                                               |-- /upload.cgi -> static upload.bin
+                                                               |                  -> upload.lock (O_EXCL, concurrency=1)
+                                                               |                  -> <SHARE_DIR>/<basename>
+                                                               |-- /list.cgi   -> static manage.bin (JSON listing)
+                                                               `-- /mkdir.cgi  -> static manage.bin (mkdir)
 ```
 
-bozohttpd **rebuilds the CGI environment from scratch** and drops custom variables, so `upload.c`'s `TC_SHARE_DIR` / `TC_STATE_DIR` cannot simply be exported by the boot hook. A generated `/bin/sh` shim in managed Flash `bin/` re-supplies those two variables and `exec`s the static `upload.bin`. `.htpasswd` is not recursive; using `-C .cgi` keeps the `/upload.cgi` request inside the docroot, so **one** `.htpasswd` link in the docroot protects both GET and POST.
+**Why a unified dispatcher:** bozohttpd's `-C .cgi` maps one suffix to **one** handler; it cannot give upload/list/mkdir separate handlers. Switching to `-c <cgibin dir>` would require a second `.htpasswd` and put program files next to user data. We therefore keep `-C .cgi` (which preserves the single docroot `.htpasswd` auth for every `.cgi` URL) and generate a `/bin/sh` dispatcher in managed Flash `bin/`. It restores `TC_SHARE_DIR` / `TC_STATE_DIR` (bozohttpd rebuilds the CGI environment) and routes by `SCRIPT_NAME`. `.htpasswd` is not recursive, but `-C` keeps every action inside the docroot, so **one** link protects GET `/` and all POSTs.
+
+The management homepage is a **program file**: its master copy lives in managed Flash `etc/index.html`, and a hidden copy (`<SHARE_DIR>/.tc-webshare-index.html`) is published into the docroot and served as the default index via bozohttpd `-x`. `-H` hides it from the generated directory listing. Uninstall deletes exactly that file; all other docroot files are user data and are never touched.
 
 ### 3. Deployment path strategy
 
@@ -75,12 +80,14 @@ bozohttpd **rebuilds the CGI environment from scratch** and drops custom variabl
 ├── build/
 │   ├── env.sh                 cross env; TOOLCHAIN_DIR/SYSROOT/SRC_ROOT overrides, CC includes --sysroot
 │   ├── fetch_src.sh           idempotent NetBSD source download/unpack; reuses /wb-build/src
-│   └── build_thttpd.sh        historical name; builds bozohttpd -> httpd + upload.cgi
+│   └── build_thttpd.sh        historical name; builds httpd + upload.cgi + manage.cgi
 ├── src/upload.c               streaming multipart upload CGI (unchanged)
+├── src/manage.c               list/mkdir CGI (static, JSON, path whitelist)
 ├── deploy/
 │   ├── common.sh              dependency-light on-device helpers
 │   ├── install.sh / uninstall.sh
 │   ├── boot_hook.sh           starts bozohttpd with verified flags
+│   ├── index.html             management homepage template (program file)
 │   ├── htpasswd.example       placeholder only
 │   └── thttpd.conf            historical, informational only
 └── docs/device-layout.md      on-device layout and ownership
@@ -177,6 +184,28 @@ curl -u admin:'<password>' -H 'Expect:' -F 'file=@/path/to/test.txt' \
 # Failed when curl sends the default "Expect: 100-continue".
 ```
 
+#### Web management UI (v1.0.3)
+
+Open `http://<device-lan-ip>:8080/` in a browser and pass the Basic auth
+dialog. The hidden management homepage is served automatically; the top
+toolbar offers **file upload** (multiple files), **new folder**, and refresh.
+The table below shows top-level entries with size, UTC mtime, download link,
+and directory markers, rendered from `/list.cgi` (JSON) without any CDN.
+
+Endpoints (all behind the same docroot `.htpasswd`):
+
+| URL | Method | Purpose |
+| --- | --- | --- |
+| `/list.cgi` | GET | JSON list of top-level entries; dotfiles skipped |
+| `/mkdir.cgi` | POST `name=...` (form-urlencoded) or GET query | create a folder |
+| `/upload.cgi` | POST multipart | existing streaming uploader |
+
+Folder names use the same whitelist as uploaded filenames: `[A-Za-z0-9._-]`,
+max 200 chars, no leading dot, no `/`, `\`, spaces or control characters;
+`..` is rejected and existing names return 409. Browser `FormData` uploads do
+not send `Expect: 100-continue`, so the curl-only `-H 'Expect:'` workaround is
+not needed in the web UI.
+
 ### 7. Verification checklist
 
 - [ ] `netstat -an | sed -n '/LISTEN/p'` shows 8080 (Samba 139/445/548 normally present)
@@ -254,14 +283,16 @@ GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSM
 
 ### 2. 为何改用 bozohttpd
 
-`build/build_thttpd.sh` 保留历史文件名，实际编译 **bozohttpd**（NetBSD base httpd）：
+`build/build_thttpd.sh` 保留历史文件名，实际编译 **bozohttpd**（NetBSD base httpd）以及 `upload.cgi`、`manage.cgi` 两个静态 CGI：
 
 - 源码就在我们已下载的 NetBSD 源码树里，不再需要外部 thttpd 包；
 - 官方编译开关已用真工具链复现：`-DDO_HTPASSWD -DNO_SSL_SUPPORT -DNO_LUA_SUPPORT`；
 - CGI、目录索引、Basic auth 功能等价；
 - 参数与 thttpd 及旧版文档都不同（已查 `main.c` / `bozohttpd.8`）：`-b` 后台、`-I <port>` 端口（**不是** `-p`，那是 public_html）、docroot 是**位置参数**（`-d` 是 debug）、`-C .cgi <handler>` 后缀映射 CGI、`-X` 索引（默认关）、`-H` 隐藏点文件、`-P <pidfile>`、`-U <user>` 切用户（本包不用）。**没有 `-D` / `-g` 选项。**
 
-bozohttpd 会**重建 CGI 环境**，自定义变量全部丢失，所以 `upload.c` 依赖的 `TC_SHARE_DIR` / `TC_STATE_DIR` 由 managed Flash `bin/` 里的 `/bin/sh` 垫片补上再 `exec` 静态 `upload.bin`。`.htpasswd` 不递归；用 `-C .cgi` 让 `/upload.cgi` 请求落在 docroot，因此**一份** docroot `.htpasswd` 同时保护 GET 与 POST。
+**为何用统一分发器**：bozohttpd 的 `-C .cgi` 只能把一个后缀映射到**一个** handler，不能给 upload/list/mkdir 分别配置。改用 `-c <cgibin目录>` 则需要第二份 `.htpasswd`，还会把程序文件混进用户数据目录。因此保留 `-C .cgi`（所有 `.cgi` URL 都在 docroot，受同一份 `.htpasswd` 保护），由 managed Flash `bin/` 中生成的 `/bin/sh` 分发器补回 `TC_SHARE_DIR` / `TC_STATE_DIR`（bozohttpd 会重建 CGI 环境），再按 `SCRIPT_NAME` 路由到三个静态二进制。
+
+管理首页是**程序文件**：主副本放在 managed Flash `etc/index.html`，并把隐藏副本 `<SHARE_DIR>/.tc-webshare-index.html` 发布到 docroot，用 bozohttpd `-x` 作为默认首页；`-H` 让它不出现在自动目录索引里。卸载只精确删除该文件，docroot 中其他文件一律视为用户数据。
 
 ### 3. 部署路径策略
 
@@ -297,7 +328,7 @@ SYSROOT=/wb-build/tc-earmv4-netbsd7/obj/destdir.evbarm \
 SRC_ROOT=/wb-build/src BUILD_OUT=/path/to/stage ./run.sh
 ```
 
-产物 `httpd`、`upload.cgi` 必须同时通过 `nbfile`（含 `statically linked`）与 `objdump -p`（无 `INTERP`/`DYNAMIC`）校验。`fetch_src.sh` 优先 `/wb-build/usr/src`，也会复用卷里的 `/wb-build/src`；两者不一致时明确报错。
+产物 `httpd`、`upload.cgi`、`manage.cgi` 必须全部通过 `nbfile`（含 `statically linked`）与 `objdump -p`（无 `INTERP`/`DYNAMIC`）校验。`fetch_src.sh` 优先 `/wb-build/usr/src`，也会复用卷里的 `/wb-build/src`；两者不一致时明确报错。
 
 静态检查：`for f in run.sh build/*.sh deploy/*.sh; do sh -n "$f" || exit 1; done`
 
@@ -316,6 +347,20 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 `install.sh` 会先设 PATH，再做路径守卫、Flash 剩余空间检查、命令检查；容忍 Samba 未启动；识别首次安装/原地更新；安装二进制、配置与 CGI 垫片；写入凭据；在 `starting native manager` 前插入 `|| true` 包裹的标记块；校验 boot.sh 非 Web 行；以 `-b -I 8080 -C .cgi ... -X -H -P ...` 拉起 bozohttpd 并检查 8080。
 
 **Flash 是同步写入、极慢**：用 `cp` 写 656KB 的 `httpd` 曾耗时约 20 分钟并导致设备失联；安装脚本已改用 `dd bs=64k`，真机实测约 30 秒。boot.sh 的临时文件放在 16MB RAM tmpfs，绝不写 Flash。上传测试必须带 `-H 'Expect:'`，否则 bozohttpd 会因默认 `Expect: 100-continue` 返回 417。
+
+#### 网页管理界面（v1.0.3）
+
+浏览器打开 `http://<设备IP>:8080/` 并通过 Basic auth 后，会自动看到隐藏的管理首页：顶部工具栏提供**多文件上传**、**新建文件夹**、刷新；下方表格显示顶层文件名、大小、UTC 修改时间、下载链接与目录标记，由 `/list.cgi`（JSON）渲染，完全离线、无外部 CDN。
+
+接口（均受 docroot 同一份 `.htpasswd` 保护）：
+
+| URL | 方法 | 用途 |
+| --- | --- | --- |
+| `/list.cgi` | GET | 顶层条目 JSON 列表，跳过所有点文件 |
+| `/mkdir.cgi` | POST 表单 `name=...` 或 GET query | 新建文件夹 |
+| `/upload.cgi` | POST multipart | 原有流式上传 |
+
+文件夹名与上传文件使用同一白名单：`[A-Za-z0-9._-]`、最长 200 字符、不允许前导点、斜杠、反斜杠、空格及控制字符，`..` 被拒绝，重名返回 409。浏览器 `FormData` 不会发送 `Expect: 100-continue`，因此网页上传不需要 curl 的 `-H 'Expect:'` 补丁。
 
 ### 7. 验证清单 / 8. 回退 / 9. 安全 / 10. 许可
 

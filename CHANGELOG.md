@@ -1,5 +1,42 @@
 # Changelog / 变更记录
 
+## v1.0.3 — 2026-11-21 — 网页管理界面 / Web management UI
+
+The device served only bozohttpd's bare directory index. This release adds a
+self-contained management homepage, a JSON listing endpoint and a folder
+creation endpoint, without weakening the single-`.htpasswd` auth model.
+用户反馈目录页没有上传/新建入口；本版加入离线管理首页、列表接口与建文件夹接口，且不削弱单份 `.htpasswd` 认证。
+
+### Design / 设计
+
+- Kept `-C .cgi` instead of switching to `-c <cgibin dir>`: the former keeps
+  every `.cgi` request inside the docroot, so one `.htpasswd` covers all
+  endpoints and no program file is mixed into user data. Because `-C` maps one
+  suffix to one handler, a generated `/bin/sh` dispatcher in managed Flash
+  `bin/cgi_dispatch.sh` routes `SCRIPT_NAME` to `upload.bin` or `manage.bin`.
+  保留 `-C .cgi`（单份认证）；用 Flash 上的 shell 分发器按 SCRIPT_NAME 路由。
+- New static CGI `src/manage.c` → `manage.bin`: `/list.cgi` returns a JSON
+  array of top-level entries (dotfiles skipped, names JSON-escaped), and
+  `/mkdir.cgi` creates a folder from a URL-encoded `name` parameter with the
+  same whitelist as uploads (`[A-Za-z0-9._-]`, ≤200, no leading dot/`..`).
+  新增静态 manage.cgi：顶层列表 + 安全建文件夹。
+- Homepage master stays in managed Flash `etc/index.html`; a hidden copy
+  `.tc-webshare-index.html` is published into the docroot and served with
+  bozohttpd `-x` (hidden from `-H` index). Uninstall deletes exactly that
+  file and never other docroot files.
+  首页主副本在 Flash，隐藏副本发布到 docroot；卸载精确删除、不碰用户数据。
+
+### Verification / 验证
+
+- `sh -n` on all scripts and `gcc -fsyntax-only src/manage.c`: passed.
+- Docker cross-build produced `httpd`, `upload.cgi`, `manage.cgi`; all three
+  passed `nbfile` (statically linked ARM ELF) and `objdump -p` (no
+  INTERP/DYNAMIC).
+- Native functional tests: JSON escaping, dotfile hiding, folder creation,
+  `..`/separator rejection, duplicate → 409. Dispatcher routing tested for
+  all three SCRIPT_NAME values. Install/uninstall rehearsal confirmed the
+  hidden homepage is removed while a user file is preserved.
+
 ## v1.0.2 — 2026-11-21 — 真机部署验证与踩坑回写 / Real-device deployment verified
 
 A full on-device deployment was completed and accepted by the lead. This

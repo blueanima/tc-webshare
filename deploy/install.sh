@@ -48,10 +48,12 @@ PIDFILE=${STATE_DIR}/bozohttpd.pid
 HTPASSWD=${ETC_DIR}/htpasswd
 MANIFEST=${STATE_DIR}/manifest
 NONWEB_SNAPSHOT=${STATE_DIR}/boot.nonweb
+INDEX_FILE_NAME=.tc-webshare-index.html
 
 HTTPD=${BIN_DIR}/httpd
 UPLOAD_BIN=${BIN_DIR}/upload.bin
-UPLOAD_SHIM=${BIN_DIR}/upload_shim
+MANAGE_BIN=${BIN_DIR}/manage.bin
+CGI_SHIM=${BIN_DIR}/cgi_dispatch.sh
 BOOT_HOOK=${BIN_DIR}/boot_hook.sh
 
 require_cmds
@@ -61,6 +63,8 @@ guard_path ROOT_DIR "${ROOT_DIR}"
 [ -f "${BOOT_SH}" ] || die "boot hook ${BOOT_SH} not found"
 [ -f "${BIN_SRC}/httpd" ] || die "missing static binary ${BIN_SRC}/httpd"
 [ -f "${BIN_SRC}/upload.cgi" ] || die "missing static binary ${BIN_SRC}/upload.cgi"
+[ -f "${BIN_SRC}/manage.cgi" ] || die "missing static binary ${BIN_SRC}/manage.cgi"
+[ -f "${PKG_ROOT}/deploy/index.html" ] || die "missing management homepage template"
 [ -f "${PKG_ROOT}/deploy/boot_hook.sh" ] || die "missing boot hook source"
 [ -f "${PKG_ROOT}/deploy/common.sh" ] || die "missing common helper source"
 
@@ -192,7 +196,8 @@ mkdir -p "${BIN_DIR}" "${ETC_DIR}" "${STATE_DIR}" "${SHARE_DIR}"
 # 64 KiB blocks reduced that to ~30 s in the real deployment.
 dd if="${BIN_SRC}/httpd" of="${HTTPD}" bs=64k 2>/dev/null || die "cannot install ${HTTPD}"
 dd if="${BIN_SRC}/upload.cgi" of="${UPLOAD_BIN}" bs=64k 2>/dev/null || die "cannot install ${UPLOAD_BIN}"
-chmod 0755 "${HTTPD}" "${UPLOAD_BIN}"
+dd if="${BIN_SRC}/manage.cgi" of="${MANAGE_BIN}" bs=64k 2>/dev/null || die "cannot install ${MANAGE_BIN}"
+chmod 0755 "${HTTPD}" "${UPLOAD_BIN}" "${MANAGE_BIN}"
 
 cp -f "${PKG_ROOT}/deploy/boot_hook.sh" "${BOOT_HOOK}" || die "cannot install boot hook"
 cp -f "${PKG_ROOT}/deploy/common.sh" "${BIN_DIR}/tc_common.sh" || die "cannot install common helpers"
@@ -207,26 +212,42 @@ chmod 0644 "${BIN_DIR}/tc_common.sh"
     printf "BIN_DIR='%s'\n" "${BIN_DIR}"
     printf "ETC_DIR='%s'\n" "${ETC_DIR}"
     printf "STATE_DIR='%s'\n" "${STATE_DIR}"
+    printf "INDEX_FILE_NAME='%s'\n" "${INDEX_FILE_NAME}"
     if [ -n "${TC_SHARE_DIR:-}" ]; then
         printf "TC_SHARE_DIR='%s'\n" "${TC_SHARE_DIR}"
     fi
 } > "${BIN_DIR}/tc_paths.sh"
 chmod 0644 "${BIN_DIR}/tc_paths.sh"
 
-# bozohttpd rebuilds the CGI environment from scratch and drops custom
-# variables.  It is started with "-C .cgi <this shim>", so the URL
-# /upload.cgi maps here and the shim re-supplies TC_SHARE_DIR / TC_STATE_DIR
-# before exec'ing the static upload.bin.  Keeping the handler in managed
-# BIN_DIR (Flash) means the unmountable disk never has to execute anything.
+# bozohttpd's "-C .cgi" maps every .cgi URL to ONE handler.  This generated
+# shell dispatcher restores TC_SHARE_DIR / TC_STATE_DIR (bozohttpd rebuilds
+# the CGI environment) and routes by SCRIPT_NAME to Flash-resident static
+# binaries.  No program file is ever executed from the unmountable disk.
 {
     printf '%s\n' '#!/bin/sh'
-    printf '%s\n' '# tc-webshare generated CGI shim (bozohttpd clears the environment).'
+    printf '%s\n' '# tc-webshare generated CGI dispatcher (bozohttpd clears the environment).'
     printf ". '%s'\n" "${BIN_DIR}/tc_paths.sh"
     printf ". '%s'\n" "${BIN_DIR}/tc_common.sh"
-    printf "TC_SHARE_DIR=\$(resolve_share_dir) TC_STATE_DIR='%s' exec '%s'\n" \
-        "${STATE_DIR}" "${UPLOAD_BIN}"
-} > "${UPLOAD_SHIM}"
-chmod 0755 "${UPLOAD_SHIM}"
+    printf "TC_SHARE_DIR=\$(resolve_share_dir)\n"
+    printf "TC_STATE_DIR='%s'\n" "${STATE_DIR}"
+    printf 'export TC_SHARE_DIR TC_STATE_DIR\n'
+    printf '%s\n' 'case "${SCRIPT_NAME:-}" in'
+    printf '  */upload.cgi) exec "%s" ;;\n' "${UPLOAD_BIN}"
+    printf '  */list.cgi|*/mkdir.cgi) exec "%s" ;;\n' "${MANAGE_BIN}"
+    printf '%s\n' '  *) printf "Status: 404 Not Found\r\nContent-Type: text/plain\r\n\r\nunknown CGI\r\n"; exit 0 ;;'
+    printf '%s\n' 'esac'
+} > "${CGI_SHIM}"
+chmod 0755 "${CGI_SHIM}"
+
+# Management homepage: keep the master copy in managed ETC_DIR (Flash) and
+# publish a hidden program file in the docroot, served via bozohttpd -x.
+# It is NOT user data and uninstall removes exactly this name.
+dd if="${PKG_ROOT}/deploy/index.html" of="${ETC_DIR}/index.html" bs=64k 2>/dev/null \
+    || die "cannot install management homepage master"
+dd if="${ETC_DIR}/index.html" of="${SHARE_DIR}/${INDEX_FILE_NAME}" bs=64k 2>/dev/null \
+    || die "cannot publish management homepage"
+chmod 0644 "${ETC_DIR}/index.html" "${SHARE_DIR}/${INDEX_FILE_NAME}"
+: > "${STATE_DIR}/managed-homepage"
 
 # Credentials and Basic auth.  With "-C .cgi" the request /upload.cgi is
 # checked against the DOCROOT's .htpasswd (same directory, no recursion
@@ -318,7 +339,8 @@ say "installed: ${WEB_ROOT}"
 say "data dir:  ${SHARE_DIR}"
 say "manifest:  ${MANIFEST}"
 say "server:    ${HTTPD} (bozohttpd)"
-say "upload:    ${UPLOAD_SHIM} -> /upload.cgi (-C .cgi) -> ${UPLOAD_BIN}"
+say "CGI shim:  ${CGI_SHIM} -> /upload.cgi, /list.cgi, /mkdir.cgi (-C .cgi)"
+say "homepage:  ${SHARE_DIR}/${INDEX_FILE_NAME}"
 say "ports:     8080=LISTEN (Samba untouched)"
 if [ "${UPDATE_MODE}" -eq 1 ]; then
     say "already installed: updated in place"

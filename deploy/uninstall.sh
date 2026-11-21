@@ -35,6 +35,7 @@ BOOT_SH=${TC_BOOT_SH:-/mnt/Flash/boot.sh}
 MANIFEST=${STATE_DIR}/manifest
 NONWEB_SNAPSHOT=${STATE_DIR}/boot.nonweb
 PIDFILE=${STATE_DIR}/bozohttpd.pid
+INDEX_FILE_NAME=${INDEX_FILE_NAME:-.tc-webshare-index.html}
 PURGE_DATA=0
 
 say() { printf '%s\n' "$*"; }
@@ -159,6 +160,12 @@ fi
 say "=== removing managed artifacts ==="
 if [ -L "${SHARE_DIR}/.htpasswd" ] || [ -e "${SHARE_DIR}/.htpasswd" ]; then
     rm -f "${SHARE_DIR}/.htpasswd"
+fi
+# The hidden homepage is a program file, not user data.  Remove exactly this
+# generated name; never touch any other file in the document root.
+if [ -f "${SHARE_DIR}/${INDEX_FILE_NAME}" ]; then
+    rm -f "${SHARE_DIR}/${INDEX_FILE_NAME}"
+    say "removed managed homepage ${SHARE_DIR}/${INDEX_FILE_NAME}"
 fi
 
 # When the disk is unmounted, SHARE_DIR is <WEB_ROOT>/data.  A plain

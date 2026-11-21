@@ -46,16 +46,17 @@ named `service`, which is why an earlier `ps` grep missed it.
 ├── bin/
 │   ├── httpd                           static bozohttpd ELF, no INTERP/DYNAMIC
 │   ├── upload.bin                      static upload.cgi ELF, LFS enabled
+│   ├── manage.bin                      static list/mkdir CGI (JSON)
+│   ├── cgi_dispatch.sh                 generated /bin/sh dispatcher: restores
+│   │                                   TC_SHARE_DIR / TC_STATE_DIR and routes
+│   │                                   SCRIPT_NAME to upload.bin / manage.bin
 │   ├── boot_hook.sh                    POSIX sh, absolute paths only
-│   ├── common.sh -> tc_common.sh       shared on-device helpers
 │   ├── tc_common.sh                    dependency-light helper library
 │   └── tc_paths.sh                     generated absolute-path constants
-├── upload_shim                         generated /bin/sh CGI handler: re-supplies
-│                                       TC_SHARE_DIR / TC_STATE_DIR to upload.bin
-│                                       (bozohttpd rebuilds the CGI env from scratch)
 ├── etc/
-│   └── htpasswd                        generated locally at install time (0600)
-│                                       linked into docroot as .htpasswd
+│   ├── htpasswd                        generated locally at install time (0600)
+│   │                                   linked into docroot as .htpasswd
+│   └── index.html                      management homepage master (program file)
 └── state/
     ├── bozohttpd.pid                   written by bozohttpd -P in daemon mode
     ├── upload.log                      appended by upload.cgi
@@ -68,7 +69,9 @@ named `service`, which is why an earlier `ps` grep missed it.
 
 ```
 <SHARE_DIR>/                              <- user data, survives normal rollback
-├── .htpasswd -> <WEB_ROOT>/etc/htpasswd  (single link protects GET / and POST /upload.cgi)
+├── .htpasswd -> <WEB_ROOT>/etc/htpasswd  (single link covers GET / and all .cgi URLs)
+├── .tc-webshare-index.html               hidden program file served via bozohttpd -x;
+│                                         removed by uninstall, never user data
 └── <user files>                          basename whitelist [A-Za-z0-9._-]
 ```
 
@@ -76,8 +79,10 @@ named `service`, which is why an earlier `ps` grep missed it.
 actively mounts dk2 (then dk3) using `/usr/bin/acp rpc diskd.useVolume
 "path:s:/Volumes/dkN"` and polls `df`, then uses `<vol>/share/web`; else a
 `<WEB_ROOT>/data` on Flash, then volatile `/mnt/Memory/.tc_webshare/share`, with a warning. bozohttpd is started with `-C .cgi <shim>` so the
-CGI URL `/upload.cgi` resolves in the docroot; `.htpasswd` is not recursive,
-but one link now covers both requests.
+all `.cgi` URLs resolve in the docroot; `.htpasswd` is not recursive, but one
+link covers every request. bozohttpd also uses `-x .tc-webshare-index.html`
+for the hidden management homepage; that generated file is a program file
+and is removed precisely on uninstall.
 
 ## boot.sh managed block
 

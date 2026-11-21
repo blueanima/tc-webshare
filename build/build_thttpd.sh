@@ -76,9 +76,14 @@ say "CC ${PKG_ROOT}/src/upload.c"
 # shellcheck disable=SC2086
 ${CC} ${CFLAGS} -o "${STAGE_BIN_DIR}/upload.cgi" "${PKG_ROOT}/src/upload.c"
 
+say "CC ${PKG_ROOT}/src/manage.c"
+# shellcheck disable=SC2086
+${CC} ${CFLAGS} -o "${STAGE_BIN_DIR}/manage.cgi" "${PKG_ROOT}/src/manage.c"
+
 # Strip if available; failure to strip is non-fatal.
 if [ -x "${STRIP}" ]; then
-    "${STRIP}" "${STAGE_BIN_DIR}/httpd" "${STAGE_BIN_DIR}/upload.cgi" || true
+    "${STRIP}" "${STAGE_BIN_DIR}/httpd" "${STAGE_BIN_DIR}/upload.cgi" \
+        "${STAGE_BIN_DIR}/manage.cgi" || true
 fi
 
 verify_static() {
@@ -104,6 +109,7 @@ verify_static() {
 
 verify_static "${STAGE_BIN_DIR}/httpd"
 verify_static "${STAGE_BIN_DIR}/upload.cgi"
+verify_static "${STAGE_BIN_DIR}/manage.cgi"
 
 {
     printf 'built=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -114,6 +120,7 @@ verify_static "${STAGE_BIN_DIR}/upload.cgi"
     printf 'cflags=%s\n' "${BASE_CFLAGS}"
     printf 'httpd_sha256=%s\n' "$(sha256sum "${STAGE_BIN_DIR}/httpd" | awk '{print $1}')"
     printf 'upload_cgi_sha256=%s\n' "$(sha256sum "${STAGE_BIN_DIR}/upload.cgi" | awk '{print $1}')"
+    printf 'manage_cgi_sha256=%s\n' "$(sha256sum "${STAGE_BIN_DIR}/manage.cgi" | awk '{print $1}')"
 } > "${STAGE_DIR}/build-info"
 
-say "build complete; static binaries in ${STAGE_BIN_DIR} (httpd, upload.cgi)"
+say "build complete; static binaries in ${STAGE_BIN_DIR} (httpd, upload.cgi, manage.cgi)"
