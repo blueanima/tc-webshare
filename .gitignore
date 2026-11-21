@@ -1,0 +1,47 @@
+# Build artifacts and staging output
+buildroot/
+build_out/
+dist/
+obj/
+*.o
+*.a
+*.so
+*.dSYM/
+
+# Local QA / rehearsal scratch files
+.qa_*
+.qa/
+*.log
+*.pid
+*.lock
+
+# Python caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Credentials and secrets — must never be committed
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+htpasswd
+!deploy/htpasswd.example
+
+# Misc
+*.tgz
+*.tar.gz
+node_modules/
