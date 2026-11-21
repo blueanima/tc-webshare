@@ -66,7 +66,7 @@ The management homepage is a **program file**: its master copy lives in managed 
 
 ### 3. Deployment path strategy
 
-- `ROOT_DIR` (binaries, config, state, manifest) defaults to **`/mnt/Flash/.tc_webshare`** — persistent and executable. Flash is only 2.7 MB; `install.sh` aborts if `df -k /mnt/Flash` reports under 1024 KiB free. Override with `TC_ROOT_DIR`.
+- `ROOT_DIR` (binaries, config, state, manifest) defaults to **`/mnt/Flash/.tc_webshare`** — persistent and executable. Flash is only 2.7 MB; `install.sh` aborts if `df -k /mnt/Flash` reports under 1024 KiB free for a fresh/partial install. A genuine update (boot.sh marker plus all three managed binaries already present) only needs **128 KiB** of headroom, because the same files are overwritten in place. Override with `TC_ROOT_DIR`.
 - `SHARE_DIR` (user data) is resolved **at install and again at every boot** by `mount_data_volume()` / `detect_data_root()`: explicit `TC_SHARE_DIR` wins; otherwise we **actively ask Apple's diskd to mount** the internal disk with `/usr/bin/acp rpc diskd.useVolume "path:s:/Volumes/dk2"` (the typed `path:s:` prefix is mandatory; bare paths fail with `-6742`), poll `df -k` until it appears, and use `/Volumes/dk2/share/web`. dk3 is tried as a second candidate so a changed dkN is tolerated. **No formatting or partition changes are ever performed** — this only mounts a volume Apple already manages. If mounting genuinely fails we fall back to the **small but persistent** `<ROOT_DIR>/data` on Flash with a loud capacity warning; only if Flash is unavailable do we use volatile `/mnt/Memory/.tc_webshare/share` (also loudly warned). dk2 was confirmed on-device with ~1.8 TB free.
 - Binaries never go on the disk (it unmounts on idle and cannot execute ELF); only data does.
 - boot.sh has `set -eu` and ends with `echo 'boot: starting native manager'` + `exec /mnt/Flash/service manager`. The marker block is inserted **before the echo** and wrapped in `{ ...; } || true`, so our hook cannot stop Samba. Appending after `exec` would never run. chmod u+w/u-w brackets the write.
@@ -168,7 +168,7 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 # Optional: TC_ROOT_DIR=... TC_SHARE_DIR=... ./deploy/install.sh
 ```
 
-`install.sh` sets PATH, guards paths, checks free Flash space and commands, tolerates inactive Samba, detects install vs. update mode, installs binaries/config/shim, writes credentials, inserts the `|| true`-wrapped marker block before the native-manager echo, verifies boot.sh's non-Web lines, starts bozohttpd with `-b -I 8080 -C .cgi ... -X -H -P ...` and checks port 8080.
+`install.sh` sets PATH, guards paths, detects install vs. update mode **before** checking free Flash space (an in-place update needs only 128 KiB, a fresh/partial install 1024 KiB), checks commands, tolerates inactive Samba, installs binaries/config/shim, writes credentials, inserts the `|| true`-wrapped marker block before the native-manager echo on fresh installs, verifies boot.sh's non-Web lines, starts bozohttpd with `-b -I 8080 -C .cgi ... -X -H -P ...` and checks port 8080.
 
 **Flash is synchronous and slow.** Copying the 656 KiB `httpd` with `cp` took
 ~20 minutes and could make the device unreachable; the installer therefore
@@ -318,7 +318,7 @@ GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSM
 
 ### 3. 部署路径策略
 
-- `ROOT_DIR`（二进制/配置/状态）默认 **`/mnt/Flash/.tc_webshare`**，持久且可执行。Flash 只有 2.7MB，安装前用 `df -k` 检查，低于 1024 KiB 直接失败。
+- `ROOT_DIR`（二进制/配置/状态）默认 **`/mnt/Flash/.tc_webshare`**，持久且可执行。Flash 只有 2.7MB，首次/不完整安装用 `df -k` 检查，低于 1024 KiB 直接失败；真正的原地更新（boot.sh 标记存在且三个管理二进制都已在位）只需 **128 KiB** 余量，因为同名文件原地覆盖、总量不增。
 - `SHARE_DIR`（用户数据）在安装与每次开机时由 `mount_data_volume()` **主动挂载**：显式 `TC_SHARE_DIR` 优先；否则执行 `/usr/bin/acp rpc diskd.useVolume "path:s:/Volumes/dk2"`（`path:s:` 类型前缀必须带，裸路径会报 `-6742`），轮询 `df -k` 确认后使用 `/Volumes/dk2/share/web`；再尝试 dk3 以容忍编号变化。**只挂载、绝不格式化或改分区**。挂载失败才回退 Flash 上的 `<ROOT_DIR>/data`（持久但空间小，明确告警；Flash 不可用才退到易失的 `/mnt/Memory/.tc_webshare/share`）；dk2 真机已确认约 1.8TB 可用。
 - 二进制不放硬盘（会卸载且不能执行），硬盘只放数据。
 - boot.sh 带 `set -eu`，结尾是 `echo 'boot: starting native manager'` + `exec /mnt/Flash/service manager`。标记块插在 **echo 之前**并用 `{ ...; } || true` 包裹，避免我们的 hook 非零导致 Samba 起不来；写前 `chmod u+w`、写后 `u-w`。
@@ -366,7 +366,7 @@ scp -O build_out/stage/bin/httpd build_out/stage/bin/upload.cgi \
 TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 ```
 
-`install.sh` 会先设 PATH，再做路径守卫、Flash 剩余空间检查、命令检查；容忍 Samba 未启动；识别首次安装/原地更新；安装二进制、配置与 CGI 垫片；写入凭据；在 `starting native manager` 前插入 `|| true` 包裹的标记块；校验 boot.sh 非 Web 行；以 `-b -I 8080 -C .cgi ... -X -H -P ...` 拉起 bozohttpd 并检查 8080。
+`install.sh` 会先设 PATH、做路径守卫，并**在 Flash 空间检查之前**判定首次安装/原地更新（原地更新只需 128 KiB，首次/不完整安装仍需 1024 KiB）；再检查命令、容忍 Samba 未启动；安装二进制、配置与 CGI 垫片；写入凭据；仅首次安装在 `starting native manager` 前插入 `|| true` 包裹的标记块；校验 boot.sh 非 Web 行；以 `-b -I 8080 -C .cgi ... -X -H -P ...` 拉起 bozohttpd 并检查 8080。
 
 **Flash 是同步写入、极慢**：用 `cp` 写 656KB 的 `httpd` 曾耗时约 20 分钟并导致设备失联；安装脚本已改用 `dd bs=64k`，真机实测约 30 秒。boot.sh 的临时文件放在 16MB RAM tmpfs，绝不写 Flash。上传测试必须带 `-H 'Expect:'`，否则 bozohttpd 会因默认 `Expect: 100-continue` 返回 417。
 

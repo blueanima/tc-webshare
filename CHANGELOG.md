@@ -67,8 +67,22 @@ touching the device.
 - Documentation correction: the README (EN/中文) and these notes now describe
   the actual name rule — printable ASCII (spaces and common symbols included)
   plus well-formed UTF-8 — instead of the narrower `[A-Za-z0-9._-]` whitelist
-  that applies only to uploads. Code, binaries and hashes are unchanged.
-  文档修正：README 中英版本条说明已与实现对齐（可打印 ASCII 含空格/常见符号 + 合法 UTF-8），不再沿用仅适用于上传的窄白名单；代码、二进制与哈希均未改动。
+  that applies only to uploads. That correction changed no code, binaries or hashes.
+  文档修正：README 中英版本条说明已与实现对齐（可打印 ASCII 含空格/常见符号 + 合法 UTF-8），不再沿用仅适用于上传的窄白名单；该次修正未改代码、二进制与哈希。
+
+### Fix / 修复
+
+- Update-mode Flash preflight no longer blocks in-place upgrades. Mode detection
+  (boot.sh marker + managed root) now runs **before** the free-space gate, and
+  the 1024 KiB threshold is relaxed to 128 KiB only when the marker **and** all
+  three managed binaries (`httpd`, `upload.bin`, `manage.bin`) already exist —
+  an update overwrites the same files in place and does not need a second copy.
+  Fresh or partially installed trees keep the 1024 KiB gate; the 128 KiB margin
+  still covers regenerated config/manifest and, when `/mnt/Memory` is absent,
+  the boot.sh scratch files. Found when a real device with 956 KiB free could
+  not install v1.0.4 over v1.0.3. **`deploy/install.sh` only — no binary or
+  hash changed.**
+  修复真机原地更新被 1024 KiB 门槛误拦：模式判定提前；仅当标记与三个二进制都在位才降到 128 KiB，首次/不完整安装仍要 1024 KiB；128 KiB 仍够配置、manifest 与（无 `/mnt/Memory` 时）boot.sh 临时文件。真机 956 KiB 空闲更新被拦是触发原因。仅改 `deploy/install.sh`，二进制与 sha256 不变。
 
 ## v1.0.3 — 2026-11-21 — 网页管理界面 / Web management UI
 

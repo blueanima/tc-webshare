@@ -68,13 +68,48 @@ guard_path ROOT_DIR "${ROOT_DIR}"
 [ -f "${PKG_ROOT}/deploy/boot_hook.sh" ] || die "missing boot hook source"
 [ -f "${PKG_ROOT}/deploy/common.sh" ] || die "missing common helper source"
 
+# Decide install vs. update BEFORE the Flash space gate: an update overwrites
+# the same three files in place and does not need room for a second copy.
+# This is the same marker-based test used below for the boot.sh block.
+MARKER_PRESENT=0
+if [ "$(marker_count "${BOOT_SH}")" -ne 0 ]; then
+    MARKER_PRESENT=1
+fi
+if [ "${MARKER_PRESENT}" -eq 1 ] && [ ! -d "${WEB_ROOT}" ]; then
+    die "boot.sh marker exists but ${WEB_ROOT} is missing; repair manually before retrying"
+fi
+if [ "${MARKER_PRESENT}" -eq 1 ]; then
+    UPDATE_MODE=1
+    say "state: already installed -> update mode (boot.sh will not be rewritten)"
+else
+    UPDATE_MODE=0
+    say "state: fresh install"
+fi
+
+# Relax the space gate only for a GENUINE update: the marker is present and
+# all three managed binaries already exist, so dd of=... just overwrites them.
+# A fresh or partially installed tree still needs room for httpd + upload.cgi
+# + config.  The small margin covers regenerated config/manifest and, if
+# /mnt/Memory is unavailable, the boot.sh scratch files on Flash.
+FULL_BINARIES_PRESENT=0
+if [ "${UPDATE_MODE}" -eq 1 ] &&
+   [ -f "${HTTPD}" ] && [ -f "${UPLOAD_BIN}" ] && [ -f "${MANAGE_BIN}" ]; then
+    FULL_BINARIES_PRESENT=1
+fi
+MIN_FLASH_KB=1024
+MODE_LABEL='a fresh installation'
+if [ "${FULL_BINARIES_PRESENT}" -eq 1 ]; then
+    MIN_FLASH_KB=128
+    MODE_LABEL='an in-place update'
+fi
+
 # Flash is tight (2.7 MB total).  Abort early if there is not enough room
-# for httpd + upload.cgi + config instead of failing halfway through.
+# instead of failing halfway through the deployment.
 if [ -d /mnt/Flash ]; then
     flash_avail=$(df_avail_kb /mnt/Flash 2>/dev/null || true)
     if [ -n "${flash_avail}" ]; then
-        [ "${flash_avail}" -ge 1024 ] || die "only ${flash_avail} KiB free on /mnt/Flash; need >= 1024 KiB for the static binaries"
-        say "/mnt/Flash free: ${flash_avail} KiB"
+        [ "${flash_avail}" -ge "${MIN_FLASH_KB}" ] || die "only ${flash_avail} KiB free on /mnt/Flash; need >= ${MIN_FLASH_KB} KiB for ${MODE_LABEL}"
+        say "/mnt/Flash free: ${flash_avail} KiB (minimum ${MIN_FLASH_KB} KiB for ${MODE_LABEL})"
     else
         warn "cannot determine /mnt/Flash free space (df -k unavailable?)"
     fi
@@ -103,20 +138,8 @@ if port_listening 8080; then
     say "WARN: port 8080 is already listening while ${WEB_ROOT} exists; checking update mode"
 fi
 
-MARKER_PRESENT=0
-if [ "$(marker_count "${BOOT_SH}")" -ne 0 ]; then
-    MARKER_PRESENT=1
-fi
-if [ "${MARKER_PRESENT}" -eq 1 ] && [ ! -d "${WEB_ROOT}" ]; then
-    die "boot.sh marker exists but ${WEB_ROOT} is missing; repair manually before retrying"
-fi
-if [ "${MARKER_PRESENT}" -eq 1 ]; then
-    UPDATE_MODE=1
-    say "state: already installed -> update mode (boot.sh will not be rewritten)"
-else
-    UPDATE_MODE=0
-    say "state: fresh install"
-fi
+# UPDATE_MODE / MARKER_PRESENT were determined in preflight, before the
+# Flash space gate; do not recompute them here.
 
 if [ -n "${TC_WEB_PASS_HASH:-}" ]; then
     WEB_PASS_HASH=${TC_WEB_PASS_HASH}
