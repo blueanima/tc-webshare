@@ -201,14 +201,18 @@ nonweb_file() {
     src_file=$1
     out_file=$2
     inside=0
-    : > "${out_file}"
-    while IFS= read -r line || [ -n "${line}" ]; do
-        case "${line}" in
-            "${MARK_BEGIN}") inside=1; continue ;;
-            "${MARK_END}")   inside=0; continue ;;
-        esac
-        [ "${inside}" -eq 1 ] || printf '%s\n' "${line}" >> "${out_file}"
-    done < "${src_file}"
+    # Keep the output FD open for the whole loop.  Reopening with ">>" on
+    # every line is pathologically slow on the TC's synchronous mfs/Flash
+    # (each append triggers a sync); a single redirect is equivalent and fast.
+    {
+        while IFS= read -r line || [ -n "${line}" ]; do
+            case "${line}" in
+                "${MARK_BEGIN}") inside=1; continue ;;
+                "${MARK_END}")   inside=0; continue ;;
+            esac
+            [ "${inside}" -eq 1 ] || printf '%s\n' "${line}"
+        done < "${src_file}"
+    } > "${out_file}"
 }
 
 # Line-exact comparison of two TEXT files using only shell builtins.  This
@@ -254,26 +258,30 @@ insert_marker_block() {
     block_file=$2
     out_file=$3
     inserted=0
-    : > "${out_file}"
-    while IFS= read -r line || [ -n "${line}" ]; do
-        case "${line}" in
-            *"starting native manager"*|*exec*"/mnt/Flash/service manager"*)
-                if [ "${inserted}" -eq 0 ]; then
-                    while IFS= read -r block_line || [ -n "${block_line}" ]; do
-                        printf '%s\n' "${block_line}" >> "${out_file}"
-                    done < "${block_file}"
-                    inserted=1
-                fi
-                ;;
-        esac
-        printf '%s\n' "${line}" >> "${out_file}"
-    done < "${boot_file}"
-    if [ "${inserted}" -eq 0 ]; then
-        warn "no native-manager marker line found in ${boot_file}; appending block at end"
-        while IFS= read -r block_line || [ -n "${block_line}" ]; do
-            printf '%s\n' "${block_line}" >> "${out_file}"
-        done < "${block_file}"
-    fi
+    # Single redirect for the whole loop: appending with ">>" line-by-line
+    # reopens and fsyncs the file each time, which is pathologically slow on
+    # the TC's synchronous Flash filesystem.
+    {
+        while IFS= read -r line || [ -n "${line}" ]; do
+            case "${line}" in
+                *"starting native manager"*|*exec*"/mnt/Flash/service manager"*)
+                    if [ "${inserted}" -eq 0 ]; then
+                        while IFS= read -r block_line || [ -n "${block_line}" ]; do
+                            printf '%s\n' "${block_line}"
+                        done < "${block_file}"
+                        inserted=1
+                    fi
+                    ;;
+            esac
+            printf '%s\n' "${line}"
+        done < "${boot_file}"
+        if [ "${inserted}" -eq 0 ]; then
+            warn "no native-manager marker line found in ${boot_file}; appending block at end"
+            while IFS= read -r block_line || [ -n "${block_line}" ]; do
+                printf '%s\n' "${block_line}"
+            done < "${block_file}"
+        fi
+    } > "${out_file}"
     return 0
 }
 
