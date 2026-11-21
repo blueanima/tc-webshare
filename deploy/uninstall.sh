@@ -18,7 +18,13 @@ set -eu
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PATH
 
-PKG_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# The device has no dirname/awk.  Pure POSIX shell dirname via ${0%/*}.
+case "$0" in
+    */*) tc_script_dir=${0%/*}; [ -n "${tc_script_dir}" ] || tc_script_dir=/ ;;
+    *)   tc_script_dir=. ;;
+esac
+SCRIPT_DIR=$(CDPATH= cd -- "${tc_script_dir}" && pwd)
+PKG_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
 . "${PKG_ROOT}/deploy/common.sh"
 
 ROOT_DIR=${TC_ROOT_DIR:-/mnt/Flash/.tc_webshare}

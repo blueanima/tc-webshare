@@ -1,5 +1,47 @@
 # Changelog / 变更记录
 
+## v1.0.2 — 2026-11-21 — 真机部署验证与踩坑回写 / Real-device deployment verified
+
+A full on-device deployment was completed and accepted by the lead. This
+release writes the observed pitfalls back into the repository so the documented
+procedure is reproducible without the ad-hoc fixes used during deployment.
+lead 已完成完整真机部署并验收通过；本版把踩坑与修复回写仓库，使文档流程可复现。
+
+### Real-device validation / 真机验证
+
+- `install.sh` → `INSTALL OK`; static binaries run on the device.
+  安装成功，静态二进制在真机正常运行。
+- Unauthenticated `GET /` → 401; authenticated GET → 200 + directory index.
+  未认证 401、认证后 200 与目录索引。
+- Upload with `curl -H 'Expect:'` succeeded and the file landed on the mounted
+  internal disk; direct request to `.htpasswd` → 403.
+  上传落盘硬盘，`.htpasswd` 直接请求 403。
+- boot.sh marker block sits before the final `exec`; TimeCapsuleSMB / Samba
+  untouched. `uninstall.sh` restored boot.sh byte-for-byte and kept user data.
+  标记块位置正确，Samba 未动；回退逐字节还原且保留用户数据。
+- **NOT validated:** no physical reboot. Boot autostart was exercised by
+  running `boot_hook.sh` directly (including its acp mount step) and checking
+  idempotence.
+  **未验证**：未做物理断电重启；开机自启通过直接执行 boot_hook 验证幂等。
+
+### Pitfalls fixed / 踩坑修复
+
+- The device has **no `dirname` and no `awk`** (QA's matrix missed `dirname`).
+  `deploy/install.sh`, `deploy/uninstall.sh` and `deploy/boot_hook.sh` now
+  compute their script directory with pure POSIX shell `${0%/*}`, working for
+  both relative and absolute invocation paths.
+  设备无 `dirname`/`awk`，三个脚本改用 `${0%/*}` 纯 shell 实现。
+- Flash is synchronous and extremely slow: `cp` of the 656 KiB `httpd` took
+  ~20 minutes and risked making the device unreachable. `install.sh` now uses
+  `dd bs=64k` (~30 s on device); boot.sh scratch files live on RAM tmpfs.
+  二进制安装改为 `dd bs=64k`，临时文件放 RAM tmpfs。
+- Upload tests with plain `curl -F` failed with `417 Expectation Failed`;
+  document the mandatory `-H 'Expect:'` header.
+  上传测试必须加 `-H 'Expect:'`，否则 417。
+- README (EN/中文) gained a real-device validation section and the updated
+  command matrix; `dd` added to `require_cmds`.
+  双语 README 增加真机验证清单与命令矩阵。
+
 ## v1.0.1 — 2026-11-21 — 真机事实适配 / Real-device事实 adaptation
 
 Based on the lead's authoritative on-device probe. This is a **deployment and

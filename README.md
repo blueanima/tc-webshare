@@ -12,7 +12,7 @@ A plaintext HTTP file-sharing kit for **AirPort Time Capsule firmware 7.9.1**: b
 
 This repository contains source, scripts and documentation only. All builds happen inside Docker; **no network device is contacted, no ssh/scp to real hardware is performed, and no credential file is read**.
 
-> **Verification status — honest disclosure (updated in v1.0.1).** Build-side: the cross toolchain, sysroot and NetBSD source tree in the `tc_wb` Docker volume were used to compile `httpd` and `upload.cgi`, and both artifacts were checked with `nbfile` and `objdump -p` (pure static ARM ELF). Device-side: the lead verified that these statically linked earmv4 ELF binaries **execute on the real Time Capsule** (no `Exec format error`). **A complete on-device deployment / HTTP / authentication / reboot / rollback run has NOT been performed.** See [CHANGELOG.md](CHANGELOG.md).
+> **Verification status — honest disclosure (updated in v1.0.2).** Build-side: the `tc_wb` Docker toolchain/sysroot compiled `httpd` and `upload.cgi`; both passed `nbfile` + `objdump -p` (pure static ARM ELF). Device-side: a **full deployment was performed and accepted** (INSTALL OK, 401/200, upload landed on the disk, `.htpasswd` 403, byte-exact rollback, Samba untouched). **A physical reboot was NOT performed**: boot-time autostart was validated by executing `boot_hook.sh` directly and checking idempotence. See the release notes at the end of this README and [CHANGELOG.md](CHANGELOG.md).
 
 ### 1. Device facts and hard constraints (on-device probe, authoritative)
 
@@ -25,7 +25,13 @@ This repository contains source, scripts and documentation only. All builds happ
 | Boot hook | `/mnt/Flash/boot.sh` belongs to **TimeCapsuleSMB**, ends with `exec /mnt/Flash/service manager`, is effectively read-only (`chmod u+w` / `u-w` window) |
 | TimeCapsuleSMB | Installed and complete (`/mnt/Flash/service` manager, `tcapsulesmb.conf`, `seed_profile.sh`, diskd/wcifsnd guards), but smbd was **not running** and there were no runtime logs — must not be treated as a deployment precondition |
 | Commands present | `/bin/sh`, `/bin/ls`, `/usr/bin/sed`, `/bin/df`, `/usr/bin/netstat`, `/usr/bin/tail`, `/bin/curl`, `/usr/bin/openssl` (`dgst -sha256`, `base64 -d`), plus `mkdir/cp/rm/mv/cat/ln/dd/date/sleep/ps/kill/sort/basename/expr` |
-| Commands absent | `grep`, `head`, `find`, `awk`, `tr`, `cut`, `base64`, `sha256sum`, `id`, `mktemp`, `stat`, `readlink`, `tee`, `wget`, `nc`, `mount`, `disklabel`, `file`; **tc-toolbox is not installed** |
+| Commands absent | `grep`, `head`, `find`, `awk`, **`dirname`**, `tr`, `cut`, `base64`, `sha256sum`, `id`, `mktemp`, `stat`, `readlink`, `tee`, `wget`, `nc`, `mount`, `disklabel`, `file`; **tc-toolbox is not installed** |
+
+The missing `dirname` was a real deployment failure: the three deploy scripts
+now compute their own directory with pure shell `${0%/*}` and need no external
+helper. NAWK/mktemp-free temp files use `$$` suffixes placed on RAM tmpfs
+(`/mnt/Memory/.tc_webshare_scratch`), because editing files on synchronous
+Flash is extremely slow.
 | Word size | 32-bit ⇒ **LFS mandatory**: `-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE` |
 
 Every script sets `PATH=/bin:/sbin:/usr/bin:/usr/sbin` first (interactive SSH lacks `/sbin`). Scripts use only shell builtins plus the commands above; `install.sh` checks them with `require_cmds` before touching any path. QA confirmed Samba **is** running (139/445/548/22 LISTEN; the process is named `service`).
@@ -156,12 +162,19 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 
 `install.sh` sets PATH, guards paths, checks free Flash space and commands, tolerates inactive Samba, detects install vs. update mode, installs binaries/config/shim, writes credentials, inserts the `|| true`-wrapped marker block before the native-manager echo, verifies boot.sh's non-Web lines, starts bozohttpd with `-b -I 8080 -C .cgi ... -X -H -P ...` and checks port 8080.
 
+**Flash is synchronous and slow.** Copying the 656 KiB `httpd` with `cp` took
+~20 minutes and could make the device unreachable; the installer therefore
+uses `dd bs=64k`, which took ~30 s in the real deployment. Scratch files for
+boot.sh rewriting go to the 16 MB RAM tmpfs, never to Flash.
+
 Upload test (from a LAN client):
 
 ```sh
-curl -u admin:'<password>' -F 'file=@/path/to/test.txt' \
+curl -u admin:'<password>' -H 'Expect:' -F 'file=@/path/to/test.txt' \
      http://<device-lan-ip>:8080/upload.cgi
-# Expect "OK files=1 bytes=..." and the file in SHARE_DIR
+# Expect "OK files=1 bytes=..." and the file in SHARE_DIR.
+# The -H 'Expect:' header is REQUIRED: bozohttpd replies 417 Expectation
+# Failed when curl sends the default "Expect: 100-continue".
 ```
 
 ### 7. Verification checklist
@@ -193,6 +206,21 @@ Plaintext HTTP on a trusted wired LAN only; TLS is out of scope. `upload.c` whit
 
 GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSMB's original copyright header. NetBSD / bozohttpd sources are downloaded from official releases at build time and are not redistributed here.
 
+### 11. Release notes — real-device validation (v1.0.2)
+
+**Validated on the real AirPort Time Capsule:**
+
+- `install.sh` completed with `INSTALL OK`; static binaries execute on the device.
+- Unauthenticated `GET /` → 401; authenticated GET → 200 with a directory index.
+- File upload via `curl -H 'Expect:'` returned success and the file landed on the internal disk (the mounted `/Volumes/dkN` share).
+- A request against `.htpasswd` itself returned 403.
+- The boot.sh marker block is in place before the final `exec`, and TimeCapsuleSMB / Samba were left untouched.
+- `uninstall.sh` restored boot.sh byte-for-byte and preserved user data (verified with the line-exact snapshot).
+
+**Not validated:** no physical power cycle / reboot was performed. Boot-time autostart was exercised by running `boot_hook.sh` directly and confirming idempotence, including its acp disk-mount step.
+
+**Real-device pitfalls fixed in this release:** missing `dirname`/`awk` (removed from deploy scripts), `curl` `Expect: 100-continue` → 417 (`-H 'Expect:'`), slow synchronous Flash writes (`dd bs=64k` instead of `cp`), and boot.sh scratch files moved to RAM tmpfs.
+
 ---
 
 <a id="chinese"></a>
@@ -203,7 +231,7 @@ GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSM
 
 本仓库只含源码、脚本和文档。构建在 Docker 中完成，**不连接真机、不读写任何凭据文件**。
 
-> **验证状态（诚实声明，v1.0.1 更新）**：构建侧已用 `tc_wb` 卷内的工具链、sysroot 与 NetBSD 源码实际编译出 `httpd` 与 `upload.cgi`，并用 `nbfile` 和 `objdump -p` 双重校验为纯静态 ARM ELF。设备侧：lead 已实测这两个静态 ELF **能在真机执行**（无 `Exec format error`）。**但尚未做完整的真机部署 / HTTP / 认证 / 重启 / 回退验证。** 详见 [CHANGELOG.md](CHANGELOG.md)。
+> **验证状态（诚实声明，v1.0.2 更新）**：构建侧已用 `tc_wb` 卷内工具链/sysroot 编译出 `httpd` 与 `upload.cgi`，并通过 `nbfile` + `objdump -p` 双重静态校验。设备侧：**已完成完整真机部署并验收通过**（INSTALL OK、401/200、上传落盘硬盘、`.htpasswd` 403、回退逐字节还原、Samba 未动）。**未做物理断电重启**：开机自启是通过直接执行 `boot_hook.sh` 并验证幂等（含 acp 挂载）来确认的。详见文末发布说明与 [CHANGELOG.md](CHANGELOG.md)。
 
 ### 1. 设备事实与硬约束（真机探测，权威）
 
@@ -217,7 +245,9 @@ GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSM
 | TimeCapsuleSMB | 已安装且完整，但 smbd **未运行**、无运行日志——不能作为部署前置条件 |
 | 可用命令 | `/bin/sh`、`/bin/ls`、`/usr/bin/sed`、`/bin/df`、`/usr/bin/netstat`、`/usr/bin/tail`、部分 `/usr/bin/find` |
 | 可用命令补充 | `/bin/curl`、`/usr/bin/openssl`（可 `dgst -sha256`、`base64 -d`）、`sort/basename/expr/dd/ps` 等 |
-| 缺失命令 | `grep`、`head`、`find`、`awk`、`tr`、`cut`、`base64`、`sha256sum`、`id`、`mktemp`、`stat`、`readlink`、`tee`、`wget`、`nc`、`mount`、`disklabel`、`file`；**tc-toolbox 未安装** |
+| 缺失命令 | `grep`、`head`、`find`、`awk`、**`dirname`**、`tr`、`cut`、`base64`、`sha256sum`、`id`、`mktemp`、`stat`、`readlink`、`tee`、`wget`、`nc`、`mount`、`disklabel`、`file`；**tc-toolbox 未安装** |
+
+缺少 `dirname` 是本次真机部署的实际踩坑：三个部署脚本已改用纯 shell `${0%/*}` 自算目录，不再依赖外部命令。临时文件用 `$$` 后缀并放在 RAM tmpfs（`/mnt/Memory/.tc_webshare_scratch`），因为同步写 Flash 极慢。
 | 字长 | 32 位 ⇒ **LFS 必开** |
 
 每个脚本首先设 `PATH=/bin:/sbin:/usr/bin:/usr/sbin`（交互 SSH 缺 `/sbin`）。脚本只用 shell 内建与上述命令，动手前用 `require_cmds` 检查。QA 确认 Samba **正在运行**（139/445/548/22 LISTEN，进程名是 `service`）。旧文档里的性能数字是 thttpd 时代的经验值，**bozohttpd 未重新实测**。
@@ -285,6 +315,16 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 
 `install.sh` 会先设 PATH，再做路径守卫、Flash 剩余空间检查、命令检查；容忍 Samba 未启动；识别首次安装/原地更新；安装二进制、配置与 CGI 垫片；写入凭据；在 `starting native manager` 前插入 `|| true` 包裹的标记块；校验 boot.sh 非 Web 行；以 `-b -I 8080 -C .cgi ... -X -H -P ...` 拉起 bozohttpd 并检查 8080。
 
+**Flash 是同步写入、极慢**：用 `cp` 写 656KB 的 `httpd` 曾耗时约 20 分钟并导致设备失联；安装脚本已改用 `dd bs=64k`，真机实测约 30 秒。boot.sh 的临时文件放在 16MB RAM tmpfs，绝不写 Flash。上传测试必须带 `-H 'Expect:'`，否则 bozohttpd 会因默认 `Expect: 100-continue` 返回 417。
+
 ### 7. 验证清单 / 8. 回退 / 9. 安全 / 10. 许可
 
-见英文版对应章节：重点确认 8080 LISTEN、401 认证、`/upload.cgi` 上传落点、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、开机后 boot hook 通过 acp 重新挂载硬盘并继续使用 `/Volumes/dk2/share/web`（失败时明确告警并回退 Flash 小容量数据目录）、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；GPL-3.0-or-later。
+见英文版对应章节：重点确认 8080 LISTEN、401 认证、`/upload.cgi` 上传落点（curl 必须加 `-H 'Expect:'`）、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、开机后 boot hook 通过 acp 重新挂载硬盘并继续使用 `/Volumes/dk2/share/web`（失败时明确告警并回退 Flash 小容量数据目录）、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；GPL-3.0-or-later。
+
+### 11. 发布说明 — 真机验证结果（v1.0.2）
+
+**已在真机验证通过**：`install.sh` 完整执行并返回 INSTALL OK；未认证 `GET /` → 401、认证后 → 200 且可见目录索引；带 `-H 'Expect:'` 的 curl 上传成功且文件落在已挂载硬盘的共享目录；直接请求 `.htpasswd` → 403；boot.sh 标记块位于最终 `exec` 之前且 TimeCapsuleSMB / Samba 未被改动；`uninstall.sh` 逐字节还原 boot.sh 并保留用户数据。
+
+**未验证**：没有做物理断电重启。开机自启通过直接执行 `boot_hook.sh`（含 acp 挂载步骤）并确认幂等来验证。
+
+**本版修复的真机踩坑**：设备缺 `dirname`/`awk`（脚本改为纯 shell 实现）、curl 默认 `Expect: 100-continue` 导致 417（加 `-H 'Expect:'`）、同步 Flash 写盘过慢（`cp` 改 `dd bs=64k`）、boot.sh 临时文件改放 RAM tmpfs。

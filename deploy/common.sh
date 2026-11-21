@@ -34,7 +34,7 @@ MARK_END=${MARK_END:-'# <<< TC_WEBSHARE END <<<'}
 # Commands we truly depend on.  Missing ones abort before any path is
 # touched.  Deliberately NOT in the list: grep/awk/head/tr/wc/mount/sha256sum/
 # ps/find/nc/wget/curl/htpasswd/openssl/od.
-REQUIRED_CMDS=${REQUIRED_CMDS:-mkdir cp rm chmod sleep ls df sed netstat cat}
+REQUIRED_CMDS=${REQUIRED_CMDS:-mkdir cp rm chmod sleep ls df sed netstat cat dd}
 
 require_cmds() {
     missing=''

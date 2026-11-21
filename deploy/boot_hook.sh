@@ -21,7 +21,12 @@ set -u
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PATH
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# The device has no dirname/awk.  Pure POSIX shell dirname via ${0%/*}.
+case "$0" in
+    */*) tc_script_dir=${0%/*}; [ -n "${tc_script_dir}" ] || tc_script_dir=/ ;;
+    *)   tc_script_dir=. ;;
+esac
+SCRIPT_DIR=$(CDPATH= cd -- "${tc_script_dir}" && pwd)
 . "${SCRIPT_DIR}/tc_paths.sh"
 . "${SCRIPT_DIR}/tc_common.sh"
 

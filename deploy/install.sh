@@ -24,7 +24,13 @@ set -eu
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PATH
 
-PKG_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# The device has no dirname/awk.  Pure POSIX shell dirname via ${0%/*}.
+case "$0" in
+    */*) tc_script_dir=${0%/*}; [ -n "${tc_script_dir}" ] || tc_script_dir=/ ;;
+    *)   tc_script_dir=. ;;
+esac
+SCRIPT_DIR=$(CDPATH= cd -- "${tc_script_dir}" && pwd)
+PKG_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
 . "${PKG_ROOT}/deploy/common.sh"
 
 # --- configurable paths ---------------------------------------------------
@@ -181,8 +187,11 @@ nonweb_file "${BOOT_SH}" "${TMP_NONWEB}"
 say "=== installing artifacts ==="
 mkdir -p "${BIN_DIR}" "${ETC_DIR}" "${STATE_DIR}" "${SHARE_DIR}"
 
-cp -f "${BIN_SRC}/httpd" "${HTTPD}" || die "cannot install ${HTTPD}"
-cp -f "${BIN_SRC}/upload.cgi" "${UPLOAD_BIN}" || die "cannot install ${UPLOAD_BIN}"
+# On this firmware Flash is synchronous and very slow: cp of a 656 KiB
+# binary took ~20 minutes and could make the device unreachable.  dd with
+# 64 KiB blocks reduced that to ~30 s in the real deployment.
+dd if="${BIN_SRC}/httpd" of="${HTTPD}" bs=64k 2>/dev/null || die "cannot install ${HTTPD}"
+dd if="${BIN_SRC}/upload.cgi" of="${UPLOAD_BIN}" bs=64k 2>/dev/null || die "cannot install ${UPLOAD_BIN}"
 chmod 0755 "${HTTPD}" "${UPLOAD_BIN}"
 
 cp -f "${PKG_ROOT}/deploy/boot_hook.sh" "${BOOT_HOOK}" || die "cannot install boot hook"
