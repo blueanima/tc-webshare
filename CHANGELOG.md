@@ -55,8 +55,8 @@ build adaptation**, not a feature release.
   install and the boot hook now actively mount the internal disk and use
   `/Volumes/dk2/share/web` (dk3 fallback), so uploads survive reboot. No
   formatting or partition operation is performed. Only a genuine mount
-  failure falls back to volatile `/mnt/Memory/.tc_webshare/share` with a loud
-  warning. `BIN_SRC` default corrected to `build_out/stage/bin`. Uninstall
+  failure falls back to small but persistent `<ROOT_DIR>/data` on Flash with
+  a loud capacity warning, then to volatile `/mnt/Memory` only as last resort. `BIN_SRC` default corrected to `build_out/stage/bin`. Uninstall
   preserves data unless `--purge-data`. Samba is in fact running; its absence
   is only a warning. TimeCapsuleSMB is never modified.
 - Scripts avoid grep/awk/head/find/tr/cut/base64/sha256sum/mktemp/stat/mount

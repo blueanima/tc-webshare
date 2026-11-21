@@ -168,8 +168,11 @@ resolve_share_dir() {
     fi
     if vol=$(mount_data_volume); then
         printf '%s\n' "${vol}/share/web"
+    elif [ -d /mnt/Flash ] && [ -w /mnt/Flash ]; then
+        warn "disk mount failed; using SMALL PERSISTENT Flash fallback ${ROOT_DIR}/data (limited space, keep uploads tiny)"
+        printf '%s\n' "${ROOT_DIR}/data"
     else
-        warn "disk mount failed; data falls back to VOLATILE tmpfs /mnt/Memory/.tc_webshare/share (uploads will NOT survive reboot)"
+        warn "disk and Flash fallback unavailable; using VOLATILE tmpfs /mnt/Memory/.tc_webshare/share (uploads will NOT survive reboot)"
         printf '%s\n' "/mnt/Memory/.tc_webshare/share"
     fi
 }

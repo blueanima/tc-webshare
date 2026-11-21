@@ -10,7 +10,7 @@ the build machine or by this repository's scripts.
 | --- | --- | --- |
 | `/` (md0a) | 15 MB | reset at boot; never store state here |
 | `/mnt/Flash` (flash2a) | 2.7 MB | persistent; **our binaries live here** |
-| `/mnt/Memory` (tmpfs) | 16 MB | volatile fallback only when acp mount fails |
+| `/mnt/Memory` (tmpfs) | 16 MB | last-resort volatile fallback only if acp mount and Flash both fail |
 | `/Volumes/dkN` | SATA disk | mounted on demand by Apple, unmounts when idle, **N changes every boot**, binaries cannot run from it |
 
 `/etc/fstab` contains only the first three entries. `/Volumes/` was empty at
@@ -22,8 +22,9 @@ keeps binaries/config on Flash but **actively mounts** the disk at install
 and at every boot, then writes user DATA under `/Volumes/dk2/share/web`
 (dk3 is a fallback if numbering changes). Never format or repartition. Only
 if acp and polling fail do we fall back to volatile
-`/mnt/Memory/.tc_webshare/share` with a loud warning. Binaries are never run
-from dkN.
+the small but persistent `<WEB_ROOT>/data` on Flash (loud capacity warning),
+and only if Flash is unavailable to volatile `/mnt/Memory/.tc_webshare/share`.
+Binaries are never run from dkN.
 
 QA also confirmed Samba **is** running (139/445/548/22 LISTEN); the process is
 named `service`, which is why an earlier `ps` grep missed it.
@@ -35,7 +36,7 @@ named `service`, which is why an earlier `ps` grep missed it.
 | `/mnt/Flash/boot.sh` | TimeCapsuleSMB (read-only except the managed write window) | Only the managed marker block is removed; every other line is compared line-for-line with the install-time snapshot |
 | TimeCapsuleSMB's `/mnt/Flash/service`, `tcapsulesmb.conf`, `seed_profile.sh`, `diskd`/`wcifsnd` guards | **DO NOT TOUCH** | never read-modify-written; Samba may be stopped, that is only warned about |
 | `/mnt/Flash/.tc_webshare/` | **tc-webshare managed (rollback boundary)** | removed completely by `uninstall.sh` |
-| `/Volumes/dkN/share/web/` (or volatile tmpfs fallback) | User upload data | preserved by default; deleted only with `--purge-data` |
+| `/Volumes/dkN/share/web/` (or Flash `data/` / tmpfs fallback) | User upload data | preserved by default; deleted only with `--purge-data` |
 | data root `cgi-bin/.tc-webshare-link` | CGI directory ownership marker | removed on rollback; no binary is stored there |
 
 ## Managed tree (default ROOT_DIR=/mnt/Flash/.tc_webshare)
@@ -74,7 +75,7 @@ named `service`, which is why an earlier `ps` grep missed it.
 `SHARE_DIR` resolution order: explicit `TC_SHARE_DIR`; else `mount_data_volume()`
 actively mounts dk2 (then dk3) using `/usr/bin/acp rpc diskd.useVolume
 "path:s:/Volumes/dkN"` and polls `df`, then uses `<vol>/share/web`; else a
-volatile `/mnt/Memory/.tc_webshare/share` with a warning. bozohttpd is started with `-C .cgi <shim>` so the
+`<WEB_ROOT>/data` on Flash, then volatile `/mnt/Memory/.tc_webshare/share`, with a warning. bozohttpd is started with `-C .cgi <shim>` so the
 CGI URL `/upload.cgi` resolves in the docroot; `.htpasswd` is not recursive,
 but one link now covers both requests.
 
