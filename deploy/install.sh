@@ -1,190 +1,96 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# install.sh - idempotent deployment of tc-webshare onto AirPort Time Capsule.
+# install.sh - idempotent deployment of tc-webshare (bozohttpd) onto an
+# AirPort Time Capsule, firmware 7.9.1 / NetBSD 6.0 evbarm earmv4.
 #
-# Target: NetBSD 6.0 / evbarm / earmv4, firmware 7.9.1.
-# Rules:
-#   * Never touch /Volumes/dk2/.tc_tools or .samba4.
-#   * boot.sh gets exactly one marker block; non-Web lines are preserved.
-#   * All managed artifacts live under /Volumes/dk2/.tc_webshare.
-#   * User data lives under /Volumes/dk2/share/web and is never deleted here.
+# v1.0.1 device facts honoured here:
+#   * /mnt/Flash (2.7 MB) holds our binaries/config; it is the only small,
+#     persistent filesystem we may EXECUTE from.
+#   * the SATA disk is mounted on demand as /Volumes/dkN (N CHANGES per boot),
+#     unmounts when idle, and binaries may NOT be run from it.  We only put
+#     user DATA there when it is currently mounted; otherwise data falls
+#     back to /mnt/Memory (tmpfs).
+#   /mnt/Flash/boot.sh belongs to TimeCapsuleSMB.  We insert exactly one
+#   marker block before its final `exec /mnt/Flash/service manager` line and
+#   never rewrite any non-Web line.  Samba may be stopped: warn, do not abort.
 #
 # Usage (on the device, from the copied package):
-#   TC_WEB_USER=admin TC_WEB_PASSWORD='...' ./deploy/install.sh
-#   TC_WEB_PASS_HASH='<crypt(3) hash>' ./deploy/install.sh   # preferred
+#   TC_WEB_PASS_HASH='<crypt(3) hash>' ./deploy/install.sh
+#   TC_ROOT_DIR=/mnt/Flash/.my_share TC_SHARE_DIR=/mnt/Memory/share ./deploy/install.sh
 #
 # Copyright (C) 2026 tc-webshare contributors - GPL-3.0-or-later.
 # ---------------------------------------------------------------------------
 set -eu
 
 PKG_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "${PKG_ROOT}/deploy/common.sh"
 
-ROOT_DIR=${TC_ROOT_DIR-/Volumes/dk2}
-WEB_ROOT=${TC_WEB_ROOT-${ROOT_DIR}/.tc_webshare}
-SHARE_DIR=${TC_SHARE_DIR-${ROOT_DIR}/share/web}
-BOOT_SH=${TC_BOOT_SH-/mnt/Flash/boot.sh}
-BIN_SRC=${TC_BIN_SRC-${PKG_ROOT}/build_out/bin}
-CONFIG_SRC=${TC_CONFIG_SRC-${PKG_ROOT}/deploy/thttpd.conf}
-HOOK_SRC=${TC_HOOK_SRC-${PKG_ROOT}/deploy/boot_hook.sh}
-EXAMPLE_SRC=${TC_EXAMPLE_SRC-${PKG_ROOT}/deploy/htpasswd.example}
-
+# --- configurable paths ---------------------------------------------------
+ROOT_DIR=${TC_ROOT_DIR:-/mnt/Flash/.tc_webshare}
+WEB_ROOT=${ROOT_DIR}
 BIN_DIR=${WEB_ROOT}/bin
+CGI_DIR=${WEB_ROOT}/cgi-bin
 ETC_DIR=${WEB_ROOT}/etc
 STATE_DIR=${WEB_ROOT}/state
-PIDFILE=${STATE_DIR}/thttpd.pid
+BOOT_SH=${TC_BOOT_SH:-/mnt/Flash/boot.sh}
+
+BIN_SRC=${TC_BIN_SRC:-${PKG_ROOT}/build_out/bin}
+EXAMPLE_SRC=${TC_EXAMPLE_SRC:-${PKG_ROOT}/deploy/htpasswd.example}
+
+PIDFILE=${STATE_DIR}/httpd.pid
 HTPASSWD=${ETC_DIR}/htpasswd
 MANIFEST=${STATE_DIR}/manifest
+NONWEB_SNAPSHOT=${STATE_DIR}/boot.nonweb
 
-MARK_BEGIN='# >>> TC_WEBSHARE BEGIN >>>'
-MARK_END='# <<< TC_WEBSHARE END <<<'
+HTTPD=${BIN_DIR}/httpd
+UPLOAD_BIN=${BIN_DIR}/upload.bin
+UPLOAD_CGI=${CGI_DIR}/upload.cgi
+BOOT_HOOK=${BIN_DIR}/boot_hook.sh
 
-PATH=${ROOT_DIR}/.tc_tools/bin:${PATH}
-export PATH
+require_cmds
 
-say() { printf '%s\n' "$*"; }
-die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-
-port_listening() {
-    check_port=$1
-    if command -v netstat >/dev/null 2>&1; then
-        if netstat -an 2>/dev/null | awk -v p="${check_port}" '
-                $0 ~ /LISTEN/ && $4 ~ ("[.]" p "$") { found = 1 }
-                END { exit(found ? 0 : 1) }'; then
-            return 0
-        fi
-    fi
-    if command -v nc >/dev/null 2>&1; then
-        if nc -z 127.0.0.1 "${check_port}" >/dev/null 2>&1; then
-            return 0
-        fi
-    fi
-    return 1
-}
-
-sha_of_file() {
-    sha256sum "$1" 2>/dev/null | awk '{print $1}'
-}
-
-# SHA-256 of boot.sh with the managed Web block filtered out.
-nonweb_sha() {
-    awk -v b="${MARK_BEGIN}" -v e="${MARK_END}" '
-        $0 == b { inside = 1; next }
-        $0 == e { inside = 0; next }
-        !inside { print }
-    ' "$1" | sha256sum | awk '{print $1}'
-}
-
-# Unified destructive-path guard (V5.4). Reject empty, relative, /, HOME,
-# protected system roots and too-shallow paths. Anything under /Volumes must
-# be under /Volumes/dk2. Absolute rehearsal paths such as
-# TC_SHARE_DIR=/tmp/stub/share/web remain valid when overridden.
-guard_path() {
-    guard_label=$1
-    guard_target=$2
-    case "${guard_target}" in
-        '') die "${guard_label} is an empty path; refusing to continue" ;;
-        /*) ;;
-        *) die "${guard_label} must be an absolute path: ${guard_target}" ;;
-    esac
-    guard_norm=$(printf '%s\n' "${guard_target}" | sed 's|/*$||')
-    [ -n "${guard_norm}" ] || die "${guard_label} resolves to an empty path"
-    [ "${guard_norm}" != "/" ] || die "${guard_label} may not be /"
-    if [ -n "${HOME:-}" ] && [ "${guard_norm}" = "${HOME}" ]; then
-        die "${guard_label} may not be HOME (${HOME})"
-    fi
-    case "${guard_norm}" in
-        /Volumes|/Volumes/|/tmp|/private/tmp|/etc|/usr|/bin|/sbin|/var|/Library|/System)
-            die "${guard_label} is a protected system path: ${guard_norm}" ;;
-    esac
-    case "${guard_norm}" in
-        /Volumes/*)
-            case "${guard_norm}" in
-                /Volumes/dk2|/Volumes/dk2/*) ;;
-                *) die "${guard_label} must be under /Volumes/dk2: ${guard_norm}" ;;
-            esac
-            ;;
-    esac
-    guard_depth=$(printf '%s\n' "${guard_norm}" | tr -cd '/' | wc -c | tr -d ' ')
-    [ "${guard_depth}" -ge 2 ] || die "${guard_label} is too shallow: ${guard_norm}"
-    return 0
-}
-
-# Only our own thttpd may be stopped during an in-place update.
-own_pid_is_thttpd() {
-    check_pid=$1
-    kill -0 "${check_pid}" 2>/dev/null || return 1
-    command -v ps >/dev/null 2>&1 || return 1
-    proc_args=$(ps -p "${check_pid}" -o args= 2>/dev/null || true)
-    [ -n "${proc_args}" ] || return 1
-    case "${proc_args}" in
-        *"${BIN_DIR}/thttpd"*) return 0 ;;
-        *"${ETC_DIR}/thttpd.conf"*) return 0 ;;
-        *".tc_webshare/bin/thttpd"*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-stop_own_service_for_update() {
-    if [ -f "${PIDFILE}" ]; then
-        stored_pid=$(cat "${PIDFILE}" 2>/dev/null || true)
-        case "${stored_pid}" in
-            ''|*[!0-9]*) die "pidfile ${PIDFILE} has no valid PID; refusing to kill an unknown process" ;;
-        esac
-        if kill -0 "${stored_pid}" 2>/dev/null; then
-            if ! own_pid_is_thttpd "${stored_pid}"; then
-                die "PID ${stored_pid} in pidfile is not our thttpd; refusing to kill it"
-            fi
-            kill "${stored_pid}" 2>/dev/null || die "cannot stop our thttpd (PID ${stored_pid})"
-            i=0
-            while [ "${i}" -lt 10 ] && kill -0 "${stored_pid}" 2>/dev/null; do
-                i=$((i + 1))
-                sleep 1
-            done
-            if kill -0 "${stored_pid}" 2>/dev/null; then
-                die "our thttpd (PID ${stored_pid}) did not stop; refusing to overwrite binaries"
-            fi
-            say "update mode: stopped our thttpd (PID ${stored_pid})"
-        else
-            say "update mode: stored PID ${stored_pid} is not running"
-        fi
-    fi
-    if port_listening 8080; then
-        die "port 8080 is still in use; refusing to overwrite binaries or start a duplicate"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# 1. Preflight
-# ---------------------------------------------------------------------------
 say "=== tc-webshare install: preflight ==="
 guard_path ROOT_DIR "${ROOT_DIR}"
-guard_path WEB_ROOT "${WEB_ROOT}"
-guard_path SHARE_DIR "${SHARE_DIR}"
-[ "${WEB_ROOT}" != "${ROOT_DIR}" ] || die "WEB_ROOT must differ from ROOT_DIR"
-[ "${SHARE_DIR}" != "${ROOT_DIR}" ] || die "SHARE_DIR must differ from ROOT_DIR"
-[ "${WEB_ROOT}" != "${SHARE_DIR}" ] || die "WEB_ROOT must differ from SHARE_DIR"
-
-if [ "$(uname -s)" != "NetBSD" ] && [ "${TC_ALLOW_NON_NETBSD:-0}" != "1" ]; then
-    die "target must be NetBSD (got $(uname -s)); TC_ALLOW_NON_NETBSD=1 is for dry-run tests only"
-fi
-[ -d "${ROOT_DIR}" ] || die "${ROOT_DIR} does not exist"
-mount 2>/dev/null | awk -v r="${ROOT_DIR}" '$3 == r { found = 1 } END { exit(found ? 0 : 1) }' \
-    || die "${ROOT_DIR} is not mounted"
-[ -d "${ROOT_DIR}/.tc_tools/bin" ] || die "tc-toolbox missing; refusing to deploy"
-[ -d "${ROOT_DIR}/.samba4" ] || die "Samba state dir .samba4 missing; refusing to deploy"
-port_listening 139 || die "Samba port 139 is not listening; refusing to deploy"
-port_listening 445 || die "Samba port 445 is not listening; refusing to deploy"
 [ -f "${BOOT_SH}" ] || die "boot hook ${BOOT_SH} not found"
-[ -f "${BIN_SRC}/thttpd" ] || die "missing static binary ${BIN_SRC}/thttpd"
+[ -f "${BIN_SRC}/httpd" ] || die "missing static binary ${BIN_SRC}/httpd"
 [ -f "${BIN_SRC}/upload.cgi" ] || die "missing static binary ${BIN_SRC}/upload.cgi"
-[ -f "${CONFIG_SRC}" ] || die "missing config ${CONFIG_SRC}"
-[ -f "${HOOK_SRC}" ] || die "missing boot hook ${HOOK_SRC}"
-command -v sha256sum >/dev/null 2>&1 || die "sha256sum not available in tc-toolbox"
+[ -f "${PKG_ROOT}/deploy/boot_hook.sh" ] || die "missing boot hook source"
+[ -f "${PKG_ROOT}/deploy/common.sh" ] || die "missing common helper source"
 
-# Installed-state detection MUST precede the 8080 check: a second run finds
-# our own listener and must switch to in-place update mode, not abort.
+# Flash is tight (2.7 MB total).  Abort early if there is not enough room
+# for httpd + upload.cgi + config instead of failing halfway through.
+if [ -d /mnt/Flash ]; then
+    flash_avail=$(df_avail_kb /mnt/Flash 2>/dev/null || true)
+    if [ -n "${flash_avail}" ]; then
+        [ "${flash_avail}" -ge 1024 ] || die "only ${flash_avail} KiB free on /mnt/Flash; need >= 1024 KiB for the static binaries"
+        say "/mnt/Flash free: ${flash_avail} KiB"
+    else
+        warn "cannot determine /mnt/Flash free space (df -k unavailable?)"
+    fi
+fi
+
+SHARE_DIR=$(resolve_share_dir)
+guard_path SHARE_DIR "${SHARE_DIR}"
+[ "${SHARE_DIR}" != "${WEB_ROOT}" ] || die "SHARE_DIR must differ from WEB_ROOT"
+say "managed root: ${WEB_ROOT}"
+say "data dir:     ${SHARE_DIR}"
+if detect_data_volume >/dev/null 2>&1; then
+    say "data volume:  $(detect_data_volume) (mounted disk)"
+else
+    warn "no /Volumes/dkN is mounted; data goes to tmpfs ${SHARE_DIR} and will NOT survive reboot"
+fi
+
+# Credentials: the device has neither htpasswd nor openssl.  Require a
+# pre-computed crypt(3) hash; never generate or read a plaintext password.
+if port_listening 8080; then
+    if [ ! -d "${WEB_ROOT}" ]; then
+        die "port 8080 is already in use; refusing to deploy"
+    fi
+    say "WARN: port 8080 is already listening while ${WEB_ROOT} exists; checking update mode"
+fi
+
 MARKER_PRESENT=0
-if grep -F -q -- "${MARK_BEGIN}" "${BOOT_SH}" || grep -F -q -- "${MARK_END}" "${BOOT_SH}"; then
+if [ "$(marker_count "${BOOT_SH}")" -ne 0 ]; then
     MARKER_PRESENT=1
 fi
 if [ "${MARKER_PRESENT}" -eq 1 ] && [ ! -d "${WEB_ROOT}" ]; then
@@ -192,165 +98,180 @@ if [ "${MARKER_PRESENT}" -eq 1 ] && [ ! -d "${WEB_ROOT}" ]; then
 fi
 if [ "${MARKER_PRESENT}" -eq 1 ]; then
     UPDATE_MODE=1
-    say "already installed: marker block present -> update mode (boot.sh will not be rewritten)"
-    stop_own_service_for_update
+    say "state: already installed -> update mode (boot.sh will not be rewritten)"
 else
     UPDATE_MODE=0
     say "state: fresh install"
-    if port_listening 8080; then
-        die "port 8080 is already in use; refusing to deploy"
-    fi
 fi
 
-# ---------------------------------------------------------------------------
-# 2. Install artifacts
-# ---------------------------------------------------------------------------
-say "=== installing artifacts ==="
-mkdir -p "${BIN_DIR}" "${ETC_DIR}" "${STATE_DIR}" "${SHARE_DIR}"
-
-cp -f "${BIN_SRC}/thttpd" "${BIN_DIR}/thttpd"
-cp -f "${BIN_SRC}/upload.cgi" "${BIN_DIR}/upload.cgi"
-cp -f "${HOOK_SRC}" "${BIN_DIR}/boot_hook.sh"
-chmod 0755 "${BIN_DIR}/thttpd" "${BIN_DIR}/upload.cgi" "${BIN_DIR}/boot_hook.sh"
-
-cp -f "${CONFIG_SRC}" "${ETC_DIR}/thttpd.conf"
-chmod 0644 "${ETC_DIR}/thttpd.conf"
-
-# CGI endpoint: /cgi-bin/upload.cgi maps into the managed bin directory.
-mkdir -p "${SHARE_DIR}/cgi-bin"
-if [ -L "${SHARE_DIR}/cgi-bin" ]; then
-    die "${SHARE_DIR}/cgi-bin is an unexpected symlink; resolve manually before installing"
-fi
-cp -f "${BIN_DIR}/upload.cgi" "${SHARE_DIR}/cgi-bin/upload.cgi"
-: > "${SHARE_DIR}/cgi-bin/.tc-webshare-link"
-chmod 0755 "${SHARE_DIR}/cgi-bin/upload.cgi"
-
-# Basic auth: thttpd reads .htpasswd from the served directory.
-if [ ! -f "${HTPASSWD}" ]; then
-    if [ -f "${EXAMPLE_SRC}" ]; then
-        cp -f "${EXAMPLE_SRC}" "${HTPASSWD}"
-    else
-        die "missing example credential template ${EXAMPLE_SRC}"
-    fi
+if [ -n "${TC_WEB_PASS_HASH:-}" ]; then
+    WEB_PASS_HASH=${TC_WEB_PASS_HASH}
+elif [ -f "${HTPASSWD}" ]; then
+    say "reusing existing htpasswd (set TC_WEB_PASS_HASH to rotate it)"
+    WEB_PASS_HASH=''
+else
+    die "TC_WEB_PASS_HASH is required (crypt(3) hash); the device has no htpasswd/openssl"
 fi
 WEB_USER=${TC_WEB_USER:-admin}
-WEB_PASS_HASH=${TC_WEB_PASS_HASH:-}
-WEB_PASSWORD=${TC_WEB_PASSWORD:-}
+
+# Samba is owned by TimeCapsuleSMB and is often stopped on this firmware.
+if port_listening 139 || port_listening 445; then
+    say "Samba: at least one SMB port is listening (left untouched)"
+else
+    warn "Samba ports 139/445 are not listening; TimeCapsuleSMB appears inactive. Deploying anyway."
+fi
+
+# --- 1. stop our own service for in-place updates ------------------------
+if [ "${UPDATE_MODE}" -eq 1 ] && [ -f "${PIDFILE}" ]; then
+    stored_pid=$(cat "${PIDFILE}" 2>/dev/null || true)
+    case "${stored_pid}" in
+        ''|*[!0-9]*) die "pidfile ${PIDFILE} has no valid PID; refusing to kill an unknown process" ;;
+    esac
+    if kill -0 "${stored_pid}" 2>/dev/null; then
+        verified_ours=0
+        if command -v ps >/dev/null 2>&1; then
+            proc_args=$(ps -p "${stored_pid}" -o args= 2>/dev/null || true)
+            case "${proc_args}" in
+                *"${HTTPD}"*) verified_ours=1 ;;
+            esac
+        fi
+        if [ "${verified_ours}" -eq 0 ]; then
+            warn "cannot verify PID ${stored_pid} ownership (no ps / no match); NOT killing it"
+            die "stop PID ${stored_pid} manually, then re-run install to overwrite binaries"
+        fi
+        kill "${stored_pid}" || die "cannot stop our httpd (PID ${stored_pid})"
+        i=0
+        while [ "${i}" -lt 10 ] && kill -0 "${stored_pid}" 2>/dev/null; do
+            i=$((i + 1))
+            sleep 1
+        done
+        if kill -0 "${stored_pid}" 2>/dev/null; then
+            die "our httpd (PID ${stored_pid}) did not stop; refusing to overwrite binaries"
+        fi
+        say "update mode: stopped our httpd (PID ${stored_pid})"
+    else
+        say "update mode: stored PID ${stored_pid} is not running"
+    fi
+fi
+
+# --- 2. snapshot non-Web boot.sh lines BEFORE any change ------------------
+TMP_NONWEB=${STATE_DIR}/boot.nonweb.new.$$
+TMP_BLOCK=${STATE_DIR}/boot.block.$$
+TMP_BOOT=${STATE_DIR}/boot.new.$$
+mkdir -p "${STATE_DIR}"
+
+nonweb_file "${BOOT_SH}" "${TMP_NONWEB}"
+[ -s "${TMP_NONWEB}" ] || die "cannot compute non-Web boot.sh content"
+
+# --- 3. install artifacts -------------------------------------------------
+say "=== installing artifacts ==="
+mkdir -p "${BIN_DIR}" "${CGI_DIR}" "${ETC_DIR}" "${STATE_DIR}" "${SHARE_DIR}" "${SHARE_DIR}/cgi-bin"
+
+cp -f "${BIN_SRC}/httpd" "${HTTPD}" || die "cannot install ${HTTPD}"
+cp -f "${BIN_SRC}/upload.cgi" "${UPLOAD_BIN}" || die "cannot install ${UPLOAD_BIN}"
+chmod 0755 "${HTTPD}" "${UPLOAD_BIN}"
+
+cp -f "${PKG_ROOT}/deploy/boot_hook.sh" "${BOOT_HOOK}" || die "cannot install boot hook"
+cp -f "${PKG_ROOT}/deploy/common.sh" "${BIN_DIR}/tc_common.sh" || die "cannot install common helpers"
+chmod 0755 "${BOOT_HOOK}"
+chmod 0644 "${BIN_DIR}/tc_common.sh"
+
+# Paths file: source this before tc_common.sh.  Values are absolute and
+# deliberately baked in; the DATA dir is still resolved dynamically.
+{
+    printf "# generated by tc-webshare install.sh - do not edit by hand\n"
+    printf "ROOT_DIR='%s'\n" "${WEB_ROOT}"
+    printf "BIN_DIR='%s'\n" "${BIN_DIR}"
+    printf "CGI_DIR='%s'\n" "${CGI_DIR}"
+    printf "ETC_DIR='%s'\n" "${ETC_DIR}"
+    printf "STATE_DIR='%s'\n" "${STATE_DIR}"
+    if [ -n "${TC_SHARE_DIR:-}" ]; then
+        printf "TC_SHARE_DIR='%s'\n" "${TC_SHARE_DIR}"
+    fi
+} > "${BIN_DIR}/tc_paths.sh"
+chmod 0644 "${BIN_DIR}/tc_paths.sh"
+
+# bozohttpd rebuilds the CGI environment from scratch and drops custom
+# variables.  This tiny static-binary shim re-supplies TC_SHARE_DIR /
+# TC_STATE_DIR to upload.cgi; /bin/sh exists on the device.
+{
+    printf '%s\n' '#!/bin/sh'
+    printf '%s\n' '# tc-webshare generated CGI shim (bozohttpd clears the environment).'
+    printf ". '%s'\n" "${BIN_DIR}/tc_paths.sh"
+    printf ". '%s'\n" "${BIN_DIR}/tc_common.sh"
+    printf "TC_SHARE_DIR=\$(resolve_share_dir) TC_STATE_DIR='%s' exec '%s'\n" \
+        "${STATE_DIR}" "${UPLOAD_BIN}"
+} > "${UPLOAD_CGI}"
+chmod 0755 "${UPLOAD_CGI}"
+
+# Credentials and Basic auth.  bozohttpd checks .htpasswd in the directory
+# of the request and does NOT recurse: web root and cgi-bin/ both need one.
 if [ -n "${WEB_PASS_HASH}" ]; then
     printf '%s:%s\n' "${WEB_USER}" "${WEB_PASS_HASH}" > "${HTPASSWD}"
-elif [ -n "${WEB_PASSWORD}" ]; then
-    if command -v htpasswd >/dev/null 2>&1; then
-        htpasswd -b -c "${HTPASSWD}" "${WEB_USER}" "${WEB_PASSWORD}"
-    elif command -v openssl >/dev/null 2>&1; then
-        generated_hash=$(openssl passwd -1 "${WEB_PASSWORD}")
-        printf '%s:%s\n' "${WEB_USER}" "${generated_hash}" > "${HTPASSWD}"
-    else
-        die "no htpasswd/openssl available; use TC_WEB_PASS_HASH instead"
-    fi
-else
-    # Generate a one-time password locally on the device and print it once.
-    if command -v openssl >/dev/null 2>&1; then
-        WEB_PASSWORD=$(openssl rand -hex 12)
-    elif [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
-        WEB_PASSWORD=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
-    else
-        die "cannot generate a password; set TC_WEB_PASS_HASH explicitly"
-    fi
-    if command -v htpasswd >/dev/null 2>&1; then
-        htpasswd -b -c "${HTPASSWD}" "${WEB_USER}" "${WEB_PASSWORD}"
-    elif command -v openssl >/dev/null 2>&1; then
-        generated_hash=$(openssl passwd -1 "${WEB_PASSWORD}")
-        printf '%s:%s\n' "${WEB_USER}" "${generated_hash}" > "${HTPASSWD}"
-    else
-        die "no htpasswd/openssl available; use TC_WEB_PASS_HASH instead"
-    fi
-    say "ONE-TIME generated password for '${WEB_USER}': ${WEB_PASSWORD}"
-    say "Save it now; it is not stored anywhere else by this script."
+elif [ ! -f "${HTPASSWD}" ]; then
+    [ -f "${EXAMPLE_SRC}" ] || die "missing credential template ${EXAMPLE_SRC}"
+    cp -f "${EXAMPLE_SRC}" "${HTPASSWD}"
 fi
 chmod 0600 "${HTPASSWD}"
+: > "${SHARE_DIR}/cgi-bin/.tc-webshare-link"
 
-if [ -L "${SHARE_DIR}/.htpasswd" ]; then
-    rm -f "${SHARE_DIR}/.htpasswd"
-fi
-if [ ! -e "${SHARE_DIR}/.htpasswd" ]; then
-    ln -s "${HTPASSWD}" "${SHARE_DIR}/.htpasswd"
-fi
+# Marker files/dirs owned by us in the data tree (no binaries there).
+link_htpasswd "${SHARE_DIR}" "${HTPASSWD}" || die "cannot link .htpasswd into ${SHARE_DIR}"
+link_htpasswd "${SHARE_DIR}/cgi-bin" "${HTPASSWD}" || die "cannot link .htpasswd into ${SHARE_DIR}/cgi-bin"
+link_htpasswd "${CGI_DIR}" "${HTPASSWD}" || die "cannot link .htpasswd into ${CGI_DIR}"
 
-# ---------------------------------------------------------------------------
-# 3. boot.sh marker block (only when absent)
-# ---------------------------------------------------------------------------
-BOOT_SHA_BEFORE_FULL=$(sha_of_file "${BOOT_SH}" || true)
-BOOT_SHA_NONWEB_BEFORE=$(nonweb_sha "${BOOT_SH}" || true)
-[ -n "${BOOT_SHA_NONWEB_BEFORE}" ] || die "cannot compute boot.sh non-Web checksum"
-
+# --- 4. boot.sh marker block (before the TimeCapsuleSMB exec) -------------
 if [ "${MARKER_PRESENT}" -eq 0 ]; then
     say "=== inserting managed marker block into ${BOOT_SH} ==="
-    TMP_BLOCK=${STATE_DIR}/boot.block.$$
-    TMP_BOOT=${STATE_DIR}/boot.new.$$
     {
         printf '%s\n' "${MARK_BEGIN}"
         printf '%s\n' '# tc-webshare: LAN-only HTTP share; managed block, do not edit by hand.'
-        printf '%s\n' 'if [ -x /Volumes/dk2/.tc_webshare/bin/boot_hook.sh ]; then'
-        printf '%s\n' '    /Volumes/dk2/.tc_webshare/bin/boot_hook.sh >/dev/null 2>&1'
+        printf '%s\n' '# Must stay BEFORE the TimeCapsuleSMB "exec /mnt/Flash/service manager" line.'
+        printf 'if [ -x %s ]; then\n' "${BOOT_HOOK}"
+        printf '    %s >/dev/null 2>&1\n' "${BOOT_HOOK}"
         printf '%s\n' 'fi'
         printf '%s\n' "${MARK_END}"
     } > "${TMP_BLOCK}"
 
-    awk -v block_file="${TMP_BLOCK}" '
-        { print }
-        END {
-            while ((getline line < block_file) > 0) print line
-            close(block_file)
-        }
-    ' "${BOOT_SH}" > "${TMP_BOOT}"
-
+    insert_marker_block "${BOOT_SH}" "${TMP_BLOCK}" "${TMP_BOOT}"
     chmod u+w "${BOOT_SH}" || die "chmod u+w ${BOOT_SH} failed"
-    cat "${TMP_BOOT}" > "${BOOT_SH}" || die "failed to write ${BOOT_SH}"
+    cp "${TMP_BOOT}" "${BOOT_SH}" || die "failed to write ${BOOT_SH}"
     chmod u-w "${BOOT_SH}" || die "chmod u-w ${BOOT_SH} failed"
-    rm -f "${TMP_BOOT}" "${TMP_BLOCK}"
 
-    grep -F -q -- "${MARK_BEGIN}" "${BOOT_SH}" || die "marker insertion failed"
-    grep -F -q -- "${MARK_END}" "${BOOT_SH}" || die "marker insertion failed"
-else
-    say "=== marker block already present: boot.sh untouched ==="
+    [ "$(marker_count "${BOOT_SH}")" -eq 2 ] || die "marker insertion failed (expected exactly two marker lines)"
 fi
 
-BOOT_SHA_NONWEB_AFTER=$(nonweb_sha "${BOOT_SH}" || true)
-if [ "${BOOT_SHA_NONWEB_AFTER}" != "${BOOT_SHA_NONWEB_BEFORE}" ]; then
-    die "boot.sh non-Web content changed (${BOOT_SHA_NONWEB_BEFORE} != ${BOOT_SHA_NONWEB_AFTER})"
-fi
-say "boot.sh non-Web SHA-256 unchanged: ${BOOT_SHA_NONWEB_AFTER}"
+# The non-Web portion must be byte-for-byte (line-for-line) unchanged.
+nonweb_file "${BOOT_SH}" "${TMP_NONWEB}.after"
+text_files_equal "${TMP_NONWEB}" "${TMP_NONWEB}.after" || die "boot.sh non-Web content changed; aborting"
+say "boot.sh non-Web lines unchanged"
 
-# ---------------------------------------------------------------------------
-# 4. Manifest
-# ---------------------------------------------------------------------------
+cp "${TMP_NONWEB}" "${NONWEB_SNAPSHOT}"
+chmod 0644 "${NONWEB_SNAPSHOT}"
+rm -f "${TMP_NONWEB}" "${TMP_NONWEB}.after" "${TMP_BLOCK}" "${TMP_BOOT}"
+
+# --- 5. manifest ----------------------------------------------------------
 say "=== writing manifest ==="
 {
     printf '# tc-webshare manifest (generated by install.sh)\n'
+    printf 'server=bozohttpd\n'
     printf 'marker_begin=%s\n' "${MARK_BEGIN}"
     printf 'marker_end=%s\n' "${MARK_END}"
-    printf 'install_time=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    printf 'boot_sha_full_before=%s\n' "${BOOT_SHA_BEFORE_FULL}"
-    printf 'boot_sha_nonweb_before=%s\n' "${BOOT_SHA_NONWEB_BEFORE}"
-    printf 'boot_sha_nonweb_after=%s\n' "${BOOT_SHA_NONWEB_AFTER}"
-    printf 'toolbox_count=%s\n' "$(find "${ROOT_DIR}/.tc_tools/bin" -type f | wc -l | tr -d ' ')"
-    printf 'samba_state=%s\n' "${ROOT_DIR}/.samba4"
-    for managed in "${BIN_DIR}/thttpd" "${BIN_DIR}/upload.cgi" "${BIN_DIR}/boot_hook.sh" \
-                   "${ETC_DIR}/thttpd.conf" "${HTPASSWD}" "${SHARE_DIR}/cgi-bin/upload.cgi"; do
-        printf '%s  %s\n' "$(sha_of_file "${managed}")" "${managed}"
-    done
+    printf 'root_dir=%s\n' "${WEB_ROOT}"
+    printf 'share_dir_resolved=%s\n' "${SHARE_DIR}"
+    printf 'boot_sh=%s\n' "${BOOT_SH}"
+    printf 'install_time=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'unknown')"
+    printf 'boot_nonweb_snapshot=%s\n' "${NONWEB_SNAPSHOT}"
 } > "${MANIFEST}"
 chmod 0644 "${MANIFEST}"
 
-# ---------------------------------------------------------------------------
-# 5. Start and verify
-# ---------------------------------------------------------------------------
-say "=== starting thttpd (boot hook runs only at boot time) ==="
-"${BIN_DIR}/boot_hook.sh" || die "boot_hook.sh failed to start thttpd"
+# --- 6. start and verify --------------------------------------------------
+say "=== starting bozohttpd (boot hook runs only at boot time) ==="
+"${BOOT_HOOK}" || die "boot_hook.sh failed to start bozohttpd"
 
 verified=0
 i=0
-while [ "${i}" -lt 20 ]; do
+while [ "${i}" -lt 10 ]; do
     if port_listening 8080; then verified=1; break; fi
     i=$((i + 1))
     sleep 1
@@ -358,29 +279,20 @@ done
 [ "${verified}" -eq 1 ] || die "port 8080 did not open after start"
 
 if command -v wget >/dev/null 2>&1; then
-    probe_code=$(wget -S -O /dev/null "http://127.0.0.1:8080/" 2>&1 \
-        | awk '/^[[:space:]]*HTTP\// { print $2; exit }')
+    say "HTTP client present; run: wget -S -O /dev/null http://127.0.0.1:8080/ (expect 401)"
 elif command -v curl >/dev/null 2>&1; then
-    probe_code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080/" 2>/dev/null || true)
+    say "HTTP client present; run: curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ (expect 401)"
 else
-    probe_code="SKIPPED"
-fi
-if [ "${probe_code}" = "SKIPPED" ]; then
-    say "WARN: no HTTP client on device; GET probe skipped (port 8080 is listening)"
-elif [ "${probe_code}" = "401" ]; then
-    say "GET probe: 401 Unauthorized (Basic auth is enforced) - expected"
-else
-    die "GET probe returned '${probe_code}', expected 401; check thttpd.conf and .htpasswd"
+    warn "no HTTP client on device; GET probe skipped (port 8080 is listening)"
 fi
 
 say "=== install report ==="
 say "installed: ${WEB_ROOT}"
 say "data dir:  ${SHARE_DIR}"
 say "manifest:  ${MANIFEST}"
-say "boot.sh non-Web sha256: ${BOOT_SHA_NONWEB_AFTER}"
-say "thttpd:    ${BIN_DIR}/thttpd"
-say "upload:    ${BIN_DIR}/upload.cgi -> /cgi-bin/upload.cgi"
-say "ports:     8080=LISTEN, 139/445 still LISTEN"
+say "server:    ${HTTPD} (bozohttpd)"
+say "upload:    ${UPLOAD_BIN} -> /cgi-bin/upload.cgi via ${UPLOAD_CGI}"
+say "ports:     8080=LISTEN (Samba untouched)"
 if [ "${UPDATE_MODE}" -eq 1 ]; then
     say "already installed: updated in place"
 else

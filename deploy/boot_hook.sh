@@ -1,71 +1,65 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# boot_hook.sh - idempotent thttpd starter invoked from /mnt/Flash/boot.sh.
+# boot_hook.sh - idempotent bozohttpd starter invoked from /mnt/Flash/boot.sh.
 #
-# Runs with absolute paths only; uses tools shipped in tc-toolbox where
-# possible and never assumes bash, flock, or a dynamic linker.
+# bozohttpd (NetBSD base httpd) is started in standalone daemon mode:
+#   -b            daemonise (mandatory: without it bozohttpd expects inetd stdin)
+#   -I 8080       listening port (NOT -p: that is public_html in this version)
+#   -i 0.0.0.0    bind all LAN interfaces (daemon mode only)
+#   -c <cgibin>   filesystem dir behind /cgi-bin/<scriptname> URLs
+#   -X            directory index support
+#   -H            hide dotfiles (.htpasswd) in the index
+#   -P <pidfile>  write the daemon PID (daemon mode only)
+#   <slashdir>    document root; bozohttpd chdir(2)s here
+#
+# Uses absolute paths only and the small command set checked by install.sh.
 # Copyright (C) 2026 tc-webshare contributors - GPL-3.0-or-later.
 # ---------------------------------------------------------------------------
 set -u
 
-ROOT_DIR=${TC_ROOT_DIR:-/Volumes/dk2}
-WEB_ROOT=${TC_WEB_ROOT:-${ROOT_DIR}/.tc_webshare}
-BIN_DIR=${WEB_ROOT}/bin
-ETC_DIR=${WEB_ROOT}/etc
-STATE_DIR=${WEB_ROOT}/state
-PIDFILE=${STATE_DIR}/thttpd.pid
-THTTPD=${BIN_DIR}/thttpd
-CONF=${ETC_DIR}/thttpd.conf
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "${SCRIPT_DIR}/tc_paths.sh"
+. "${SCRIPT_DIR}/tc_common.sh"
 
-PATH=${ROOT_DIR}/.tc_tools/bin:${PATH}
-export PATH
+HTTPD=${BIN_DIR}/httpd
+PIDFILE=${STATE_DIR}/httpd.pid
+HTPASSWD=${ETC_DIR}/htpasswd
 
-port_listening() {
-    check_port=$1
-    if command -v netstat >/dev/null 2>&1; then
-        if netstat -an 2>/dev/null | awk -v p="${check_port}" '
-                $0 ~ /LISTEN/ && $4 ~ ("[.]" p "$") { found = 1 }
-                END { exit(found ? 0 : 1) }'; then
-            return 0
-        fi
-    fi
-    if command -v nc >/dev/null 2>&1; then
-        if nc -z 127.0.0.1 "${check_port}" >/dev/null 2>&1; then
-            return 0
-        fi
-    fi
-    return 1
-}
-
-# Already serving: do nothing (boot hook may fire more than once).
+# Already serving: the hook may fire more than once.
 if port_listening 8080; then
     exit 0
 fi
 
-# Live PID recorded by a previous start: do not spawn a duplicate.
+# A live PID recorded by a previous start means do not spawn a duplicate.
 if [ -f "${PIDFILE}" ]; then
     stored_pid=$(cat "${PIDFILE}" 2>/dev/null || true)
     case "${stored_pid}" in
         ''|*[!0-9]*) ;;
-        *)
-            if kill -0 "${stored_pid}" 2>/dev/null; then
-                exit 0
-            fi
-            ;;
+        *) if kill -0 "${stored_pid}" 2>/dev/null; then exit 0; fi ;;
     esac
 fi
 
-[ -x "${THTTPD}" ] || exit 1
-[ -f "${CONF}" ] || exit 1
-mkdir -p "${STATE_DIR}" || exit 1
+[ -x "${HTTPD}" ] || exit 1
+mkdir -p "${CGI_DIR}" "${STATE_DIR}" || exit 1
 
-# -D keeps thttpd in the foreground so $! is the real server PID.
-"${THTTPD}" -C "${CONF}" -D >/dev/null 2>&1 &
-server_pid=$!
-printf '%s\n' "${server_pid}" > "${PIDFILE}"
+# The SATA volume may have been mounted/unmounted since install.  Recreate
+# the per-directory auth links so Basic auth keeps protecting every path.
+SHARE_DIR_NOW=$(resolve_share_dir)
+mkdir -p "${SHARE_DIR_NOW}" "${SHARE_DIR_NOW}/cgi-bin" 2>/dev/null || true
+: > "${SHARE_DIR_NOW}/cgi-bin/.tc-webshare-link" 2>/dev/null || true
+if [ -f "${HTPASSWD}" ]; then
+    link_htpasswd "${SHARE_DIR_NOW}" "${HTPASSWD}" || true
+    link_htpasswd "${SHARE_DIR_NOW}/cgi-bin" "${HTPASSWD}" || true
+    link_htpasswd "${CGI_DIR}" "${HTPASSWD}" || true
+fi
+
+# -b detaches and -P makes bozohttpd write the real server PID itself, so
+# there is no need to background it from the shell.
+"${HTTPD}" -b -I 8080 -i 0.0.0.0 -c "${CGI_DIR}" -X -H -P "${PIDFILE}" \
+    "${SHARE_DIR_NOW}" >/dev/null 2>&1 || exit 1
 
 i=0
-while [ "${i}" -lt 20 ]; do
+while [ "${i}" -lt 10 ]; do
     if port_listening 8080; then
         exit 0
     fi

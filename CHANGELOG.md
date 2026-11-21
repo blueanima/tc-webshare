@@ -1,5 +1,76 @@
 # Changelog / 变更记录
 
+## v1.0.1 — 2026-11-21 — 真机事实适配 / Real-device事实 adaptation
+
+Based on the lead's authoritative on-device probe. This is a **deployment and
+build adaptation**, not a feature release.
+
+依据 lead 的真机探测事实所做的适配，非功能新增版本。
+
+### Build / 构建
+
+- `build_thttpd.sh` keeps its historical filename but now compiles **bozohttpd**
+  (NetBSD base httpd) from `${SRC_ROOT}/libexec/httpd` into `httpd`, plus
+  `src/upload.c` into `upload.cgi`. Flags: `-DDO_HTPASSWD -DNO_SSL_SUPPORT
+  -DNO_LUA_SUPPORT`, `-static -fno-pic -fno-PIE -D_FILE_OFFSET_BITS=64
+  -D_LARGEFILE_SOURCE`.
+  `build_thttpd.sh` 保留历史文件名，实际编译 **bozohttpd** → `httpd`，并编译
+  `upload.cgi`；开关如上。
+- `env.sh`: `CC` now contains `--sysroot=${SYSROOT}`; `TOOLCHAIN_DIR`,
+  `SYSROOT`, `NBFILE` and `SRC_ROOT` can point at the bootstrapped `tc_wb`
+  volume (`/wb-build/tc-earmv4-netbsd7/...`, `/wb-build/src`) with no
+  `SDK_DIR`. Original SDK layout remains supported. **Without `--sysroot`
+  the build produces unusable binaries** — this was the earlier trap.
+  env.sh 支持卷内工具链与 sysroot，保留原 SDK 布局；`--sysroot` 必填。
+- Every artifact is rejected unless `nbfile` reports "statically linked"
+  **and** `objdump -p` shows no INTERP/DYNAMIC section. Both checks were
+  run for real in the `tc_wb` container during this release.
+  两个产物均经 nbfile + objdump 双重校验，且本轮在容器里实跑通过。
+- `fetch_src.sh` detects an already-provisioned source tree and fails loudly
+  on an `SRC_ROOT`/`EXTRACT_DIR` mismatch (the QA-flagged pitfall).
+  fetch_src.sh 识别已存在的源码树，路径不一致时明确报错。
+
+### Deploy / 部署
+
+- Default managed root moved from `/Volumes/dk2` to
+  `/mnt/Flash/.tc_webshare` (persistent, executable). Data dir is resolved
+  at install **and every boot**: mounted `/Volumes/dkN` if present, else
+  `/mnt/Memory/.tc_webshare/share`. No dkN number is hardcoded.
+  默认管理根目录改为 Flash；数据目录动态解析，不再硬编码 dkN。
+- bozohttpd CLI corrected against upstream source: `-b -I 8080 -i 0.0.0.0
+  -c <cgibin> -X -H -P <pidfile> <slashdir>` (old `-D/-p/-d` were wrong).
+  The marker block is inserted **before** `exec /mnt/Flash/service manager`
+  because boot.sh ends there; appending would be unreachable.
+  参数已按源码纠正；标记块插在 SMB `exec` 之前。
+- Generated `/bin/sh` CGI shim re-supplies `TC_SHARE_DIR` / `TC_STATE_DIR`
+  because bozohttpd rebuilds the CGI environment; `.htpasswd` links are
+  placed in both the web root and `cgi-bin/` because auth is not recursive.
+  CGI 垫片补回环境变量；两个目录都放 .htpasswd 链接。
+- Scripts now avoid grep/awk/head/mount/sha256sum/ps/find entirely; a new
+  `deploy/common.sh` provides shell-only helpers, and boot.sh verification
+  uses a line-exact `state/boot.nonweb` snapshot. Samba being stopped is a
+  warning, not a failure. TimeCapsuleSMB is never modified.
+  脚本不再依赖设备缺失的命令；Samba 未运行仅告警。
+- Credentials: `TC_WEB_PASS_HASH` is required (no htpasswd/openssl on device);
+  no plaintext password is generated or read.
+  凭据只接受预生成的 crypt(3) hash。
+
+### Verification scope / 验证范围（v1.0.1）
+
+- `sh -n` on all eight shell scripts: passed.
+  八个 shell 脚本语法检查通过。
+- Docker build in `tc_wb`: `httpd` and `upload.cgi` compiled and verified as
+  `ELF 32-bit LSB ARM EABI5 statically linked for NetBSD 7.2 earmv4`
+  (nbfile) with no INTERP/DYNAMIC (objdump).
+  容器内实编译并通过双重静态校验。
+- Lead confirmed the static earmv4 ELF binaries execute on the real device.
+  lead 已确认静态 ELF 可在真机执行。
+
+Still **not** verified: full on-device install, HTTP auth handshake, upload,
+reboot persistence and rollback. Real-device validation remains the
+operator's responsibility.
+仍未做完整真机部署、认证、上传、重启与回退验证。
+
 ## v1.0.0 — 2026-11-21
 
 Initial public release of `tc-webshare`: a static HTTP file-share deployment kit for

@@ -8,227 +8,189 @@
 
 ## English
 
-A plaintext HTTP file-sharing kit for **AirPort Time Capsule firmware 7.9.1**: browse, download and upload files on the LAN, coexist cleanly with the device's existing tc-toolbox and TimeCapsuleSMB Samba, and roll back **with byte-level verification**.
+A plaintext HTTP file-sharing kit for **AirPort Time Capsule firmware 7.9.1**: browse, download and upload files on the LAN, coexist cleanly with the device's TimeCapsuleSMB installation, and roll back **with byte-level verification**.
 
 This repository contains source, scripts and documentation only. All builds happen inside Docker; **no network device is contacted, no ssh/scp to real hardware is performed, and no credential file is read**.
 
-> **Verification status — honest disclosure.** This release was validated locally only: gcc syntax checks, POSIX `sh -n` parsing, `upload.c` functional-safety stub tests (10/10), and idempotent rollback stub rehearsals. **It has never been tested on real NetBSD 6 hardware and no real device was ever connected.** See [CHANGELOG.md](CHANGELOG.md) for the full record.
+> **Verification status — honest disclosure (updated in v1.0.1).** Build-side: the cross toolchain, sysroot and NetBSD source tree in the `tc_wb` Docker volume were used to compile `httpd` and `upload.cgi`, and both artifacts were checked with `nbfile` and `objdump -p` (pure static ARM ELF). Device-side: the lead verified that these statically linked earmv4 ELF binaries **execute on the real Time Capsule** (no `Exec format error`). **A complete on-device deployment / HTTP / authentication / reboot / rollback run has NOT been performed.** See [CHANGELOG.md](CHANGELOG.md).
 
-### 1. Device Facts and Hard Constraints (architect final)
+### 1. Device facts and hard constraints (on-device probe, authoritative)
 
 | Item | Value |
 | --- | --- |
-| Firmware | Apple AirPort Time Capsule 7.9.1 |
-| Kernel / architecture | NetBSD 6.0 / evbarm / earmv4 (ARMv4, **no Thumb / NEON**) |
-| Executable format | **Pure static ELF only** (no dynamic linker) |
-| Disk mount point | `/Volumes/dk2` |
-| Root filesystem | Reset on every reboot |
-| Boot hook | `/mnt/Flash/boot.sh` (read-only from the factory; `chmod u+w` before writing, `chmod u-w` afterwards) |
-| Must be preserved | `/Volumes/dk2/.tc_tools/bin/` (53 static tools), `/Volumes/dk2/.samba4/` (Samba, 139/445) |
-| Transfer method | sshd has no SFTP; use `scp -O` |
-| In-place `sed` | NetBSD syntax must be `sed -i ""` |
-| Shell | Every script is POSIX `#!/bin/sh` (bash is not guaranteed on the device) |
+| Firmware / OS | Apple AirPort Time Capsule 7.9.1 / NetBSD 6.0 evbarm / earmv4 (ARMv4, no Thumb/NEON) |
+| Executable format | **Pure static ELF only** (these binaries have no dynamic linker; `ld.elf_so` on Flash is irrelevant to them) |
+| Filesystems | `/` md0a 15 MB; `/mnt/Flash` flash2a 2.7 MB; `/mnt/Memory` tmpfs 16 MB. That is all of `/etc/fstab` |
+| SATA disk | `/dev/ld0` exists but was **unmounted** (`/Volumes/` empty) at probe time; Apple mounts it on demand as `/Volumes/dk2` **or** `/Volumes/dk3`, the number changes every boot, it unmounts when idle, and **binaries cannot be executed from it** |
+| Boot hook | `/mnt/Flash/boot.sh` belongs to **TimeCapsuleSMB**, ends with `exec /mnt/Flash/service manager`, is effectively read-only (`chmod u+w` / `u-w` window) |
+| TimeCapsuleSMB | Installed and complete (`/mnt/Flash/service` manager, `tcapsulesmb.conf`, `seed_profile.sh`, diskd/wcifsnd guards), but smbd was **not running** and there were no runtime logs — must not be treated as a deployment precondition |
+| Commands present | `/bin/sh`, `/bin/ls`, `/usr/bin/sed`, `/bin/df`, `/usr/bin/netstat`, `/usr/bin/tail`, partial `/usr/bin/find` |
+| Commands absent | `grep`, `head`, `mount`, `disklabel`, `file`; **tc-toolbox is not installed** |
+| Word size | 32-bit ⇒ **LFS mandatory**: `-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE` |
 
-The word size is 32-bit, so **LFS is mandatory**: cross-compilation must include `-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE`, otherwise the 32-bit `off_t` overflows at 2 GB.
+The deployment scripts use only shell builtins plus the commands above and ordinary `mkdir`/`cp`/`rm`/`chmod`/`sleep`/`cat`/`kill`; `install.sh` checks them with `require_cmds` before touching any path.
 
-#### Device performance limits (measured / empirical, not guaranteed)
+Performance figures from the earlier design (15–25 MB/s downloads, 8–15 MB/s uploads, ≤500 MB safe per file, concurrency lock = 1) are **estimates inherited from the thttpd design and have not been re-measured with bozohttpd**.
 
-- Download (thttpd, zero-fork server): typically **15–25 MB/s**
-- Upload (CGI streaming to disk): typically **8–15 MB/s**
-- Safe per-file ceiling **≤ 500 MB**; practical ceiling **1–2 GB** (limited by fragmentation and the 32-bit process address space)
-- Concurrent upload lock **= 1**: only one multipart upload at a time; duplicate requests receive `503`
-- HTTP concurrency `maxconns=10`
+### 2. Why bozohttpd instead of thttpd
 
-### 2. Architecture
+`build/build_thttpd.sh` keeps its historical filename but compiles **bozohttpd**, the NetBSD base HTTP server:
 
-```
-Browser (LAN)  --HTTP :8080-->  thttpd (static ELF, dir=/Volumes/dk2/share/web)
-                                  |-- GET /            -> Basic auth (401 / 200)
-                                  |                    -> directory index / file download (zero fork)
-                                  `-- POST /cgi-bin/upload.cgi
-                                          -> static C CGI, 64KB streaming write
-                                          -> upload.lock (O_EXCL, concurrency=1)
-                                          -> /Volumes/dk2/share/web/<basename>
-```
-
-- **Downloads / indexing** are served directly by thttpd without forking a process per request.
-- **Uploads** are handled by the static CGI built from `src/upload.c`: the multipart boundary is scanned block by block, at most 64 KiB is written per call, and a whole file is never buffered in memory.
-- All web artifacts live under `/Volumes/dk2/.tc_webshare/` (the **rollback boundary**); user uploads live in `/Volumes/dk2/share/web/` and are preserved by a default rollback.
-- Only one marker block is inserted into `/mnt/Flash/boot.sh`; the file is **never rewritten wholesale**:
+- its source ships inside the NetBSD source tree we already fetch, so no external thttpd tarball is needed;
+- the compile switches are documented upstream (`-DDO_HTPASSWD -DNO_SSL_SUPPORT -DNO_LUA_SUPPORT`) and were reproduced with the real toolchain;
+- it provides the same required features: CGI, directory index, HTTP Basic auth;
+- the exact CLI differs from thttpd and from older bozohttpd releases. Verified against `main.c` / `bozohttpd.8`: `-b` daemonise, `-I <port>` listen port (**not** `-p`, which is `public_html`), `-c <dir>` CGI directory, `-X` index, `-H` hide dotfiles, `-P <pidfile>` PID file, positional slashdir.
 
 ```
-# >>> TC_WEBSHARE BEGIN >>>
-# tc-webshare: LAN-only HTTP share; managed block, do not edit by hand.
-if [ -x /Volumes/dk2/.tc_webshare/bin/boot_hook.sh ]; then
-    /Volumes/dk2/.tc_webshare/bin/boot_hook.sh >/dev/null 2>&1
-fi
-# <<< TC_WEBSHARE END <<<
+Browser (LAN) --HTTP :8080--> bozohttpd (static ELF, slashdir=<SHARE_DIR>)
+                               |-- GET /                    -> .htpasswd 401 / index / download
+                               `-- POST /cgi-bin/upload.cgi -> <WEB_ROOT>/cgi-bin/upload.cgi
+                                                               (sh shim -> static upload.bin)
+                                                               -> upload.lock (O_EXCL, concurrency=1)
+                                                               -> <SHARE_DIR>/<basename>
 ```
 
-Uninstall deletes only the lines between and including the two markers, then uses static `sha256sum` to compare the checksum of the "non-Web lines" against the value recorded in `state/manifest`.
+bozohttpd **rebuilds the CGI environment from scratch** and drops custom variables, so `upload.c`'s `TC_SHARE_DIR` / `TC_STATE_DIR` cannot simply be exported by the boot hook. A generated `/bin/sh` shim at `/cgi-bin/upload.cgi` re-supplies those two variables and `exec`s the static `upload.bin`. bozohttpd also resolves `.htpasswd` relative to the request directory and does **not** recurse, so links are installed in the web root *and* in `cgi-bin/`.
 
-### 3. File Tree
+### 3. Deployment path strategy
+
+- `ROOT_DIR` (binaries, config, state, manifest) defaults to **`/mnt/Flash/.tc_webshare`** — persistent and executable. Flash is only 2.7 MB; `install.sh` aborts if `df -k /mnt/Flash` reports under 1024 KiB free. Override with `TC_ROOT_DIR`.
+- `SHARE_DIR` (user data) is resolved **at install and again at every boot**: first explicit `TC_SHARE_DIR`; else the first writable `/Volumes/dkN` whose filesystem differs from `/Volumes`; else `/mnt/Memory/.tc_webshare/share` (tmpfs, volatile — a warning is printed). **No dkN number is ever hardcoded.**
+- Binaries never go on the disk (it unmounts on idle and cannot execute ELF); only data does.
+- The boot block is inserted **before** TimeCapsuleSMB's final `exec /mnt/Flash/service manager` line — appending after it would never run. Uninstall removes only the two marker lines and their contents and compares the rest of boot.sh line-for-line against `state/boot.nonweb` (no `sha256sum` on the device).
+- Stopped Samba (139/445 silent) is only a warning; it is no longer a deployment blocker. TimeCapsuleSMB's files are never modified.
+
+### 4. File tree
 
 ```
-tc-webshare/
-├── README.md                 this file (EN + 中文)
-├── CHANGELOG.md               release history, verification scope and honest limitations
-├── LICENSE                    GPL-3.0-or-later full text
-├── .gitignore                 excludes build/staging/QA/credential artifacts
-├── Dockerfile                 debian:bookworm cross-build env, case-sensitive volume /wb-build
-├── run.sh                     docker build + volume + build (EXTRA and other switches)
+├── Dockerfile                 debian:bookworm cross-build image
+├── run.sh                     docker build + volume + cross build
 ├── build/
-│   ├── env.sh                 NetBSD 7.2_STABLE cross env (from TimeCapsuleSMB, GPL header kept)
-│   ├── fetch_src.sh           idempotent download/unpack of NetBSD 7.2 sources into /wb-build
-│   └── build_thttpd.sh        static build of thttpd + upload.cgi, objdump check for INTERP/DYNAMIC
-├── src/
-│   └── upload.c               streaming multipart upload CGI (LFS, filename whitelist, O_EXCL lock)
+│   ├── env.sh                 cross env; TOOLCHAIN_DIR/SYSROOT/SRC_ROOT overrides, CC includes --sysroot
+│   ├── fetch_src.sh           idempotent NetBSD source download/unpack; reuses /wb-build/src
+│   └── build_thttpd.sh        historical name; builds bozohttpd -> httpd + upload.cgi
+├── src/upload.c               streaming multipart upload CGI (unchanged)
 ├── deploy/
-│   ├── install.sh             idempotent deployment + verification report
-│   ├── uninstall.sh           idempotent rollback (user data kept by default)
-│   ├── boot_hook.sh           idempotent thttpd starter at boot
-│   ├── thttpd.conf            configuration template
-│   └── htpasswd.example       example credentials (placeholder, not a real password)
-└── docs/
-    └── device-layout.md       on-device directory layout and file ownership
+│   ├── common.sh              dependency-light on-device helpers
+│   ├── install.sh / uninstall.sh
+│   ├── boot_hook.sh           starts bozohttpd with verified flags
+│   ├── htpasswd.example       placeholder only
+│   └── thttpd.conf            historical, informational only
+└── docs/device-layout.md      on-device layout and ownership
 ```
 
-### 4. Build (local / Docker, no hardware involved)
+### 5. Build (local / Docker, no hardware involved)
 
-Prerequisites: Docker on the build machine plus a **NetBSD 7.2_STABLE evbarm/earmv4 cross toolchain** (triplet `armv4--netbsdelf-eabi`). If the toolchain is unavailable the scripts remain reproducible but cannot produce binaries in that environment.
+Prerequisites: Docker plus a NetBSD 7.2 evbarm/earmv4 toolchain. **The sysroot is mandatory**: without `--sysroot`, gcc uses host headers/libs and the result will not run. The `tc_wb` volume already contains a bootstrapped toolchain and source tree:
+
+```
+TOOLCHAIN_DIR=/wb-build/tc-earmv4-netbsd7/tools/bin
+SYSROOT=/wb-build/tc-earmv4-netbsd7/obj/destdir.evbarm
+SRC_ROOT=/wb-build/src
+```
 
 ```sh
-# 1) Build the image and run the cross build (BSD/macOS/Linux)
-SDK_DIR=/path/to/netbsd-7.2-evbarm-sdk \
-BUILD_OUT=/path/to/output/stage \
-./run.sh
+# Original SDK_DIR layout
+SDK_DIR=/path/to/netbsd-7.2-evbarm-sdk BUILD_OUT=/path/to/stage ./run.sh
 
-# 2) Artifacts (pure static ELF)
-ls "$BUILD_OUT/bin"
-# thttpd  upload.cgi  ../build-info
+# tc_wb volume layout, offline (no SDK_DIR needed)
+VOLUME=tc_wb NO_FETCH=1 \
+TOOLCHAIN_DIR=/wb-build/tc-earmv4-netbsd7/tools/bin \
+SYSROOT=/wb-build/tc-earmv4-netbsd7/obj/destdir.evbarm \
+SRC_ROOT=/wb-build/src \
+BUILD_OUT=/path/to/stage ./run.sh
 
-# 3) Force rebuild / reuse cached sources offline / append docker arguments
+# Force rebuild / reuse cached sources
 NO_CACHE=1 ./run.sh
-NO_FETCH=1 ./run.sh
-EXTRA='-e TC_ENV_QUIET=0' ./run.sh
 ```
 
-`run.sh` creates the Docker named volume `tc-webshare-wb-build` as `/wb-build` to avoid build failures caused by the case-insensitive default of macOS APFS when unpacking the NetBSD source tree. Main flags used by `build_thttpd.sh`:
-
-```
--O2 -g0 -static -fno-pic -fno-PIE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE
-```
-
-Every artifact is checked with `objdump -p`: the build fails if an `INTERP` or `DYNAMIC` section is present.
-
-#### Local static checks (no cross toolchain needed)
+Equivalent direct compile (inside a container with `/wb-build` mounted):
 
 ```sh
-# POSIX sh only parses the FIRST file passed to "sh -n", so loop over all 7.
+CC='/wb-build/tc-earmv4-netbsd7/tools/bin/armv4--netbsdelf-eabi-gcc --sysroot=/wb-build/tc-earmv4-netbsd7/obj/destdir.evbarm'
+CFLAGS='-O2 -g0 -static -fno-pic -fno-PIE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE'
+BOZO='-DDO_HTPASSWD -DNO_SSL_SUPPORT -DNO_LUA_SUPPORT -I/wb-build/src/libexec/httpd -I/wb-build/src/include'
+for f in bozohttpd.c ssl-bozo.c auth-bozo.c cgi-bozo.c daemon-bozo.c \
+         tilde-luzah-bozo.c dir-index-bozo.c content-bozo.c lua-bozo.c main.c; do
+  $CC $CFLAGS $BOZO -c /wb-build/src/libexec/httpd/$f -o $f.o
+done
+$CC -static -o httpd *.o -lcrypt -lm
+$CC $CFLAGS -o upload.cgi /path/to/tc-webshare/src/upload.c
+```
+
+Artifacts: `httpd` (bozohttpd) and `upload.cgi`. Every one must pass **both** checks:
+
+```
+nbfile <artifact>            # must say "ELF 32-bit LSB ARM EABI5 statically linked ..."
+objdump -p <artifact>        # must contain no INTERP / DYNAMIC section
+```
+
+`fetch_src.sh` prefers `/wb-build/usr/src` (what the source tarballs produce) but detects and reuses the volume's `/wb-build/src`; it fails loudly if `SRC_ROOT` and `EXTRACT_DIR` disagree.
+
+Local static checks (no toolchain needed):
+
+```sh
 for f in run.sh build/env.sh build/fetch_src.sh build/build_thttpd.sh \
-         deploy/install.sh deploy/uninstall.sh deploy/boot_hook.sh; do
+         deploy/common.sh deploy/install.sh deploy/uninstall.sh deploy/boot_hook.sh; do
     sh -n "$f" || exit 1
 done
-gcc -fsyntax-only -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE src/upload.c
 ```
 
-### 5. Deployment (run on the device)
+### 6. Deployment (on the device)
 
-Copy the whole package and the build artifacts to the device, for example:
+Copy package and artifacts (sshd has no SFTP, use `-O`):
 
 ```sh
-# Push from the build machine (sshd has no SFTP, so -O is required)
-scp -O -r tc-webshare root@<TC-LAN-IP>:/Volumes/dk2/.tc_webshare_pkg
-# Create build_out/bin on the device first, then push the artifacts
-scp -O build_out/bin/thttpd build_out/bin/upload.cgi \
-    root@<TC-LAN-IP>:/Volumes/dk2/.tc_webshare_pkg/build_out/bin/
+scp -O -r tc-webshare root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg
+scp -O build_out/bin/httpd build_out/bin/upload.cgi \
+    root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg/build_out/bin/
 ```
 
-On the device:
+Generate the hash on the build machine and deploy (the device has no `htpasswd`/`openssl`, so plaintext passwords are deliberately unsupported):
 
 ```sh
-cd /Volumes/dk2/.tc_webshare_pkg
-
-# Recommended: generate a crypt(3) hash locally and pass it via the environment (no plaintext on disk)
 TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
-
-# Or: let install.sh generate a one-time random password on the device and print it once
-./deploy/install.sh
+# Optional: TC_ROOT_DIR=... TC_SHARE_DIR=... ./deploy/install.sh
 ```
 
-`install.sh` will:
+`install.sh` guards paths, checks free Flash space, checks commands, tolerates inactive Samba, detects install vs. update mode, installs binaries/config/shim, writes credentials, inserts the marker block before the SMB `exec`, verifies boot.sh's non-Web lines, starts bozohttpd and checks port 8080.
 
-1. Preflight: apply path guards first (reject `/`, `$HOME`, `/Volumes` and other dangerous paths), then check `uname`, the `/Volumes/dk2` mount, Samba listening on 139/445, the presence of `boot.sh`, and the static tool inventory. **Detect the marker block first**: an existing installation switches to in-place update mode; a fresh install is refused only if port 8080 is occupied.
-2. In update mode, gracefully stop **its own** thttpd by pidfile (verifying process ownership with `ps`; never kill a foreign process), confirm port 8080 is free, then overwrite binaries to avoid ETXTBSY.
-3. Create `.tc_webshare/{bin,etc,state}` and `share/web/`, then install binaries, configuration and credentials.
-4. Write `state/manifest`: all installed paths, boot.sh SHA-256 before and after installation, and a timestamp.
-5. Insert the marker block idempotently (skip if present); the checksum of the non-Web lines of `boot.sh` must be identical before and after.
-6. Call `boot_hook.sh` once immediately using absolute paths (the marker block only takes effect at boot).
-7. Verify port 8080 is listening and perform one GET: expect `401 Unauthorized` (proving Basic auth is enforced).
-8. Re-running needs no prior stop: it prints `already installed: updated in place`, updates files/manifest in place and restarts thttpd automatically; it never inserts a second marker block and the non-Web lines stay byte-identical. If the PID in the pidfile is not our thttpd but holds port 8080, the script fails explicitly to avoid killing someone else's process.
-
-Upload test (requires Basic auth):
+Upload test (from a LAN client):
 
 ```sh
 curl -u admin:'<password>' -F 'file=@/path/to/test.txt' \
      http://<device-lan-ip>:8080/cgi-bin/upload.cgi
-# Expected: 200 + "OK files=1 bytes=..."; the file lands in /Volumes/dk2/share/web/
+# Expect "OK files=1 bytes=..." and the file in SHARE_DIR
 ```
 
-### 6. Verification Checklist
+### 7. Verification checklist
 
-Confirm each item after deployment:
+- [ ] `netstat -an | tail -40` shows 8080 LISTEN (Samba 139/445 may be absent)
+- [ ] `wget -S -O /dev/null http://127.0.0.1:8080/` → 401 (if a client exists)
+- [ ] authenticated GET / → 200 with a directory index, no `.htpasswd` listed
+- [ ] upload returns 200 and the file lands in the **resolved** share dir
+- [ ] duplicate filenames get `.1` suffixes; bad filenames get 400
+- [ ] `boot.sh` contains exactly one marker block, placed before the `exec` line
+- [ ] `state/boot.nonweb` matches the non-marker lines of boot.sh
+- [ ] after unmounting the disk, the boot hook still starts using the tmpfs fallback
+- [ ] TimeCapsuleSMB files are untouched; no tcn marker lines remain after uninstall
 
-- [ ] `netstat -an | grep LISTEN` shows 8080, 139 and 445 all listening
-- [ ] `wget -S -O /dev/null http://127.0.0.1:8080/` returns **401**
-- [ ] `curl -u <user>:<pass> http://127.0.0.1:8080/` returns 200 with a directory index
-- [ ] Uploading a small file returns 200 and the file appears in `/Volumes/dk2/share/web/`
-- [ ] Uploading the same filename yields `.1`, `.2` suffixes and **never overwrites** the original
-- [ ] Invalid filenames such as `../x`, `/etc/passwd`, `a\b` are rejected with 400
-- [ ] With two concurrent uploads, the second returns 503 (concurrency lock = 1)
-- [ ] `sha256sum` of boot.sh with the marker block filtered out equals the value in `state/manifest`
-- [ ] `/Volumes/dk2/.tc_tools/bin` still holds ≥ 50 files; `.samba4/` is still present
-- [ ] Port 8080 comes back automatically after a device reboot (boot.sh marker block works)
-
-### 7. Rollback
+### 8. Rollback
 
 ```sh
-cd /Volumes/dk2/.tc_webshare_pkg
-./deploy/uninstall.sh              # keep /Volumes/dk2/share/web user data
-./deploy/uninstall.sh --purge-data # delete user data only when explicitly required
+./deploy/uninstall.sh              # keep user data
+./deploy/uninstall.sh --purge-data # delete user data too
 ```
 
-`uninstall.sh` will:
+Removes the marker block, verifies boot.sh against the install-time snapshot, stops our httpd by pidfile, deletes only `ROOT_DIR`, and leaves user data and all TimeCapsuleSMB files alone. A second run prints `already clean`.
 
-1. Stop thttpd by pidfile and confirm port 8080 is closed.
-2. Use `sed -i ""` to delete only the lines between and including the two markers in boot.sh; verify the non-Web SHA-256 against the manifest.
-3. Remove only `/Volumes/dk2/.tc_webshare/`; user data is preserved by default.
-4. Verify: port 8080 closed; 139/445 still listening; `.tc_tools/bin` intact; `.samba4/` and the share root accessible; no marker block in boot.sh and checksum unchanged.
-5. Re-running after uninstall prints `already clean` and exits successfully.
+### 9. Security notes
 
-### 8. Security Notes
+Plaintext HTTP on a trusted wired LAN only; TLS is out of scope. `upload.c` whitelists `[A-Za-z0-9._-]` basenames, uses `O_EXCL|O_NOFOLLOW`, never overwrites, and serialises uploads with `upload.lock`. Credentials are supplied as a pre-computed crypt(3) hash; `htpasswd.example` is a placeholder. No plaintext password or credential file is read by this repository.
 
-- This release is **plaintext HTTP** only; use it solely on a trusted wired LAN. TLS is out of scope.
-- Basic auth credentials are generated locally on the device; the scripts read no password file on the build machine. `deploy/htpasswd.example` in this repository is a **placeholder**, not a real credential.
-- Upload filenames allow only `[A-Za-z0-9._-]`; `..`, absolute paths, backslashes, NUL and control characters are rejected, and only the basename is written.
-- Destination files are opened with `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW`; collisions get a numeric suffix, so existing files are never overwritten and symlinks are never followed.
-- The upload CGI uses `upload.lock` (`O_CREAT|O_EXCL` + PID, removed via `unlink` on exit) to enforce concurrency = 1; it does not rely on `flock` and therefore runs on NetBSD 6.
-- Neither the server nor the CGI writes to `/`; the resetting root filesystem leaves no state behind.
+### 10. License
 
-### 9. License and Attribution
-
-- Project source (except the file noted below): **GPL-3.0-or-later**, Copyright (C) 2026 tc-webshare contributors. Full text in [LICENSE](LICENSE).
-- `build/env.sh` **is derived from the TimeCapsuleSMB project's cross-build environment**. Its original copyright notice and GPL-3.0-or-later license header are preserved verbatim at the top of the file, including the source comment. Do not remove that header when re-syncing upstream.
-- `src/upload.c` and `deploy/*.sh` are implemented by this project and are GPL-3.0-or-later.
-- thttpd and NetBSD sources follow their respective upstream licenses; they are downloaded from official releases at build time and their source is not redistributed here.
-
-### 10. Changes and Boundaries
-
-- All path conventions are defined by `docs/device-layout.md`.
-- The marker strings are byte-identical in `install.sh`, `uninstall.sh`, `docs/device-layout.md` and this README:
-  - Begin: `# >>> TC_WEBSHARE BEGIN >>>`
-  - End: `# <<< TC_WEBSHARE END <<<`
-- This package does not modify tc-toolbox, Samba configuration or data; it contacts no real device and reads or writes no credential file.
+GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSMB's original copyright header. NetBSD / bozohttpd sources are downloaded from official releases at build time and are not redistributed here.
 
 ---
 
@@ -236,234 +198,90 @@ cd /Volumes/dk2/.tc_webshare_pkg
 
 ## 中文
 
-面向 **AirPort Time Capsule 固件 7.9.1** 的明文 HTTP 文件共享系统：局域网内浏览/下载上传文件，与设备上已有的 tc-toolbox 和 TimeCapsuleSMB Samba 完全共存，并且可以**字节级验证地回退**。
+面向 **AirPort Time Capsule 固件 7.9.1** 的明文 HTTP 文件共享部署包：局域网内浏览/下载/上传，与 TimeCapsuleSMB 干净共存，并支持**字节级可验证回退**。
 
-本仓库只含源码、脚本和文档。构建在 Docker 中完成，**不连接任何网络设备、不 ssh/scp 到真机、不读取任何凭据文件**。
+本仓库只含源码、脚本和文档。构建在 Docker 中完成，**不连接真机、不读写任何凭据文件**。
 
-> **验证状态（诚实声明）**：本版本仅完成本地验证——gcc 语法检查、POSIX `sh -n` 解析、`upload.c` 功能安全桩测（10/10）、回退幂等桩演练。**从未在真实 NetBSD 6 设备上实测，也未连接过任何真机。** 完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+> **验证状态（诚实声明，v1.0.1 更新）**：构建侧已用 `tc_wb` 卷内的工具链、sysroot 与 NetBSD 源码实际编译出 `httpd` 与 `upload.cgi`，并用 `nbfile` 和 `objdump -p` 双重校验为纯静态 ARM ELF。设备侧：lead 已实测这两个静态 ELF **能在真机执行**（无 `Exec format error`）。**但尚未做完整的真机部署 / HTTP / 认证 / 重启 / 回退验证。** 详见 [CHANGELOG.md](CHANGELOG.md)。
 
-### 1. 设备事实与硬约束（架构师定稿）
+### 1. 设备事实与硬约束（真机探测，权威）
 
 | 项目 | 值 |
 | --- | --- |
-| 固件 | Apple AirPort Time Capsule 7.9.1 |
-| 内核 / 架构 | NetBSD 6.0 / evbarm / earmv4（ARMv4，**无 Thumb / NEON**） |
-| 可执行格式 | **仅纯静态 ELF**（无动态链接器） |
-| 硬盘挂载点 | `/Volumes/dk2` |
-| 根文件系统 | 每次重启重置 |
-| 开机钩子 | `/mnt/Flash/boot.sh`（出厂只读；写前 `chmod u+w`，写后 `chmod u-w`） |
-| 必须保留 | `/Volumes/dk2/.tc_tools/bin/`（53 个静态工具）、`/Volumes/dk2/.samba4/`（Samba，139/445） |
-| 传输方式 | sshd 无 SFTP，传文件用 `scp -O` |
-| `sed` 就地编辑 | NetBSD 语法必须为 `sed -i ""` |
-| Shell | 全部脚本使用 POSIX `#!/bin/sh`（设备不保证 bash） |
+| 固件 / 系统 | 7.9.1 / NetBSD 6.0 evbarm / earmv4（无 Thumb/NEON） |
+| 可执行格式 | **仅纯静态 ELF**（Flash 上的 `ld.elf_so` 与我们的二进制无关） |
+| 文件系统 | `/` md0a 15MB；`/mnt/Flash` flash2a 2.7MB；`/mnt/Memory` tmpfs 16MB，`/etc/fstab` 仅此三项 |
+| 硬盘 | `/dev/ld0` 存在但探测时**未挂载**（`/Volumes/` 为空）；Apple 按需挂成 `/Volumes/dk2` 或 `dk3`，编号每次启动会变，空闲时卸载，**不能从其执行二进制** |
+| 开机钩子 | `/mnt/Flash/boot.sh` 属于 **TimeCapsuleSMB**，结尾是 `exec /mnt/Flash/service manager`，写前需 `chmod u+w` |
+| TimeCapsuleSMB | 已安装且完整，但 smbd **未运行**、无运行日志——不能作为部署前置条件 |
+| 可用命令 | `/bin/sh`、`/bin/ls`、`/usr/bin/sed`、`/bin/df`、`/usr/bin/netstat`、`/usr/bin/tail`、部分 `/usr/bin/find` |
+| 缺失命令 | `grep`、`head`、`mount`、`disklabel`、`file`；**tc-toolbox 未安装** |
+| 字长 | 32 位 ⇒ **LFS 必开** |
 
-Word size 是 32 位，所以 **LFS 必开**：交叉编译参数必须包含 `-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE`，否则 32 位 `off_t` 在 2 GB 处溢出。
+部署脚本只用 shell 内建 + 上述命令 + `mkdir/cp/rm/chmod/sleep/cat/kill`，并在动手前用 `require_cmds` 检查。旧文档里的性能数字是 thttpd 时代的经验值，**bozohttpd 未重新实测**。
 
-#### 设备性能极限（实测/经验值，非保证值）
+### 2. 为何改用 bozohttpd
 
-- 下载（thttpd，server 零 fork）：典型 **15~25 MB/s**
-- 上传（CGI 流式写盘）：典型 **8~15 MB/s**
-- 单文件安全上限 **≤ 500 MB**；实用上限 **1~2 GB**（受磁盘碎片与 32 位进程地址空间影响）
-- 并发上传锁 **= 1**：同一时刻只允许一个 multipart 上传，重复请求返回 `503`
-- HTTP 并发连接数 `maxconns=10`
+`build/build_thttpd.sh` 保留历史文件名，实际编译 **bozohttpd**（NetBSD base httpd）：
 
-### 2. 架构
+- 源码就在我们已下载的 NetBSD 源码树里，不再需要外部 thttpd 包；
+- 官方编译开关已用真工具链复现：`-DDO_HTPASSWD -DNO_SSL_SUPPORT -DNO_LUA_SUPPORT`；
+- CGI、目录索引、Basic auth 功能等价；
+- 参数与 thttpd 及旧版文档都不同（已查 `main.c` / `bozohttpd.8`）：`-b` 后台、`-I <port>` 端口（**不是** `-p`，那是 public_html）、`-c <dir>` CGI 目录、`-X` 索引、`-H` 隐藏点文件、`-P <pidfile>`、位置参数为站点根目录。
 
-```
-浏览器 (LAN)  --HTTP :8080-->  thttpd (静态 ELF, dir=/Volumes/dk2/share/web)
-                                  |-- GET /            -> Basic auth (401 / 200)
-                                  |                    -> 目录索引 / 文件下载 (零 fork)
-                                  `-- POST /cgi-bin/upload.cgi
-                                          -> 静态 C CGI, 64KB 流式写盘
-                                          -> upload.lock (O_EXCL, 并发=1)
-                                          -> /Volumes/dk2/share/web/<basename>
-```
+bozohttpd 会**重建 CGI 环境**，自定义变量全部丢失，所以 `upload.c` 依赖的 `TC_SHARE_DIR` / `TC_STATE_DIR` 由生成的 `/bin/sh` 垫片在 `/cgi-bin/upload.cgi` 处补上再 `exec` 静态 `upload.bin`。`.htpasswd` 按请求目录查找且不递归，因此站点根目录和 `cgi-bin/` 都要放链接。
 
-- **下载/索引**由 thttpd 直接处理，不为每个请求 fork 新进程。
-- **上传**由 `src/upload.c` 编译出的静态 CGI 处理：multipart 边界逐块扫描，每次最多 64 KiB 写入文件，绝不把整个文件读进内存。
-- 所有 Web 产物集中在 `/Volumes/dk2/.tc_webshare/`（**回退边界**），用户上传数据放在 `/Volumes/dk2/share/web/`（默认回退时保留）。
-- `/mnt/Flash/boot.sh` 中只插入一个标记块，**不重写整个文件**：
+### 3. 部署路径策略
 
-```
-# >>> TC_WEBSHARE BEGIN >>>
-# tc-webshare: LAN-only HTTP share; managed block, do not edit by hand.
-if [ -x /Volumes/dk2/.tc_webshare/bin/boot_hook.sh ]; then
-    /Volumes/dk2/.tc_webshare/bin/boot_hook.sh >/dev/null 2>&1
-fi
-# <<< TC_WEBSHARE END <<<
-```
+- `ROOT_DIR`（二进制/配置/状态）默认 **`/mnt/Flash/.tc_webshare`**，持久且可执行。Flash 只有 2.7MB，安装前用 `df -k` 检查，低于 1024 KiB 直接失败。
+- `SHARE_DIR`（用户数据）在安装与每次开机时**动态解析**：显式 `TC_SHARE_DIR` > 第一个已挂载且可写的 `/Volumes/dkN` > `/mnt/Memory/.tc_webshare/share`（tmpfs，易失，会告警）。**绝不硬编码 dkN 编号。**
+- 二进制不放硬盘（会卸载且不能执行），硬盘只放数据。
+- boot 标记块插在 TimeCapsuleSMB 的 `exec /mnt/Flash/service manager` **之前**；卸载只删标记块，并逐行比对 boot.sh 其余内容与 `state/boot.nonweb`（设备无 `sha256sum`）。
+- Samba 未启动仅告警，不再是部署阻断条件；TimeCapsuleSMB 文件绝不改动。
 
-卸载时只删除这两个标记之间（含标记）的行，并用静态 `sha256sum` 比对“非 Web 行”的校验和与 `state/manifest` 中记录的值一致。
+### 4. 文件树
 
-### 3. 文件树
+（同英文版，新增 `deploy/common.sh`；`deploy/thttpd.conf` 仅为历史说明文件。）
+
+### 5. 构建（本机/Docker，不碰真机）
+
+**`--sysroot` 是必填项**，否则 gcc 会用宿主机头文件/库，产物无法在设备上跑。`tc_wb` 卷里已有：
 
 ```
-tc-webshare/
-├── README.md                 本文件（英中双语）
-├── CHANGELOG.md               版本由来、验证范围与未验证项声明
-├── LICENSE                    GPL-3.0-or-later 全文
-├── .gitignore                 排除构建/暂存/QA/凭据类产物
-├── Dockerfile                 debian:bookworm 交叉构建环境，大小写敏感卷 /wb-build
-├── run.sh                     docker build + 建卷 + 构建（EXTRA 等开关）
-├── build/
-│   ├── env.sh                 NetBSD 7.2_STABLE 交叉环境（源自 TimeCapsuleSMB，保留 GPL 头）
-│   ├── fetch_src.sh           幂等下载/解包 NetBSD 7.2 源码到 /wb-build
-│   └── build_thttpd.sh        静态编译 thttpd + upload.cgi，objdump 校验无 INTERP/DYNAMIC
-├── src/
-│   └── upload.c               流式 multipart 上传 CGI（LFS，文件名白名单，O_EXCL 锁）
-├── deploy/
-│   ├── install.sh             幂等部署 + 校验报告
-│   ├── uninstall.sh           幂等回退（默认保留用户数据）
-│   ├── boot_hook.sh           开机拉起 thttpd（幂等）
-│   ├── thttpd.conf            配置模板
-│   └── htpasswd.example       示例凭据（占位，非真实口令）
-└── docs/
-    └── device-layout.md       设备目录布局与文件归属
+TOOLCHAIN_DIR=/wb-build/tc-earmv4-netbsd7/tools/bin
+SYSROOT=/wb-build/tc-earmv4-netbsd7/obj/destdir.evbarm
+SRC_ROOT=/wb-build/src
 ```
-
-### 4. 构建（本机/Docker，不碰真机）
-
-前提：本机有 Docker，且有一个 **NetBSD 7.2_STABLE evbarm/earmv4 交叉工具链**（三元组 `armv4--netbsdelf-eabi`）。本机没有该工具链也没关系，脚本可复现，只是不能在此环境产出二进制。
 
 ```sh
-# 1) 构建镜像并运行交叉编译（BSD/macOS/Linux 均可）
-SDK_DIR=/path/to/netbsd-7.2-evbarm-sdk \
-BUILD_OUT=/path/to/output/stage \
-./run.sh
+# 原 SDK_DIR 布局
+SDK_DIR=/path/to/netbsd-7.2-evbarm-sdk BUILD_OUT=/path/to/stage ./run.sh
 
-# 2) 产物（纯静态 ELF）
-ls "$BUILD_OUT/bin"
-# thttpd  upload.cgi  ../build-info
-
-# 3) 强制重建 / 离线复用缓存源码 / 追加 docker 参数
-NO_CACHE=1 ./run.sh
-NO_FETCH=1 ./run.sh
-EXTRA='-e TC_ENV_QUIET=0' ./run.sh
+# tc_wb 卷布局，离线
+VOLUME=tc_wb NO_FETCH=1 \
+TOOLCHAIN_DIR=/wb-build/tc-earmv4-netbsd7/tools/bin \
+SYSROOT=/wb-build/tc-earmv4-netbsd7/obj/destdir.evbarm \
+SRC_ROOT=/wb-build/src BUILD_OUT=/path/to/stage ./run.sh
 ```
 
-`run.sh` 会创建 Docker 命名卷 `tc-webshare-wb-build` 作为 `/wb-build`，避免 macOS APFS 默认大小写不敏感导致 NetBSD 源码树构建失败。`build_thttpd.sh` 使用的主要参数：
+产物 `httpd`、`upload.cgi` 必须同时通过 `nbfile`（含 `statically linked`）与 `objdump -p`（无 `INTERP`/`DYNAMIC`）校验。`fetch_src.sh` 优先 `/wb-build/usr/src`，也会复用卷里的 `/wb-build/src`；两者不一致时明确报错。
 
-```
--O2 -g0 -static -fno-pic -fno-PIE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE
-```
+静态检查：`for f in run.sh build/*.sh deploy/*.sh; do sh -n "$f" || exit 1; done`
 
-每个产物都经 `objdump -p` 检查：若出现 `INTERP` 或 `DYNAMIC` 段则构建失败。
-
-#### 本地静态检查（无需交叉工具链）
+### 6. 部署（设备上执行）
 
 ```sh
-# POSIX sh only parses the FIRST file passed to "sh -n", so loop over all 7.
-for f in run.sh build/env.sh build/fetch_src.sh build/build_thttpd.sh \
-         deploy/install.sh deploy/uninstall.sh deploy/boot_hook.sh; do
-    sh -n "$f" || exit 1
-done
-gcc -fsyntax-only -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE src/upload.c
-```
+# sshd 无 SFTP，必须 -O
+scp -O -r tc-webshare root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg
+scp -O build_out/bin/httpd build_out/bin/upload.cgi \
+    root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg/build_out/bin/
 
-### 5. 部署（在设备上执行）
-
-把整个包和构建产物放到设备，例如：
-
-```sh
-# 从本机推送（sshd 无 SFTP，必须用 -O）
-scp -O -r tc-webshare root@<TC-LAN-IP>:/Volumes/dk2/.tc_webshare_pkg
-# 先在设备上创建 build_out/bin 目录，再推送产物
-scp -O build_out/bin/thttpd build_out/bin/upload.cgi \
-    root@<TC-LAN-IP>:/Volumes/dk2/.tc_webshare_pkg/build_out/bin/
-```
-
-在设备上：
-
-```sh
-cd /Volumes/dk2/.tc_webshare_pkg
-
-# 推荐：先在本地生成 crypt(3) hash，再通过环境变量传入（不落盘明文）
+# 设备无 htpasswd/openssl，必须先在本地生成 crypt(3) hash
 TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
-
-# 或者：让 install.sh 在设备上生成一次性随机口令并打印一次
-./deploy/install.sh
 ```
 
-`install.sh` 会：
+`install.sh` 会做路径守卫、Flash 剩余空间检查、命令检查；容忍 Samba 未启动；识别首次安装/原地更新；安装二进制、配置与 CGI 垫片；写入凭据；在 SMB `exec` 前插入标记块；校验 boot.sh 非 Web 行；拉起 bozohttpd 并检查 8080。
 
-1. 预检：先做路径守卫（拒绝 `/`、`$HOME`、`/Volumes` 等危险路径），再查 `uname`、`/Volumes/dk2` 挂载、Samba 139/445 在听、`boot.sh` 存在、静态工具齐全。**先判定标记块**：已安装则进入原地更新模式，未安装且 8080 被占用才拒绝部署。
-2. 更新模式下先按 pidfile 优雅停掉**自身** thttpd（用 `ps` 校验 PID 归属，非自身进程绝不 kill），确认 8080 释放后再覆盖二进制，避免 ETXTBSY。
-3. 建 `.tc_webshare/{bin,etc,state}` 与 `share/web/`，装二进制、配置和凭据。
-4. 生成 `state/manifest`：所有安装路径 + boot.sh 安装前后 sha256 + 时间戳。
-5. 幂等插入标记块（已存在则跳过）；`boot.sh` 非 Web 行校验和前后必须一致。
-6. 立即用绝对路径调用一次 `boot_hook.sh`（标记块只在开机时生效）。
-7. 验证 8080 监听，并做一次 GET：期望 `401 Unauthorized`（证明 Basic auth 生效）。
-8. 重复运行无需先停服务：输出 `already installed: updated in place`，原地更新文件/清单并自动重启 thttpd；不会插入第二个标记块，非 Web 行字节不变。若 pidfile 的 PID 不是自身 thttpd 却占着 8080，则明确报错退出，防止误杀他人进程。
+### 7. 验证清单 / 8. 回退 / 9. 安全 / 10. 许可
 
-上传测试（需要 Basic auth）：
-
-```sh
-curl -u admin:'<password>' -F 'file=@/path/to/test.txt' \
-     http://<device-lan-ip>:8080/cgi-bin/upload.cgi
-# 期望: 200 + "OK files=1 bytes=..."；文件落在 /Volumes/dk2/share/web/
-```
-
-### 6. 验证清单
-
-部署后逐项确认：
-
-- [ ] `netstat -an | grep LISTEN` 显示 8080、139、445 均在听
-- [ ] `wget -S -O /dev/null http://127.0.0.1:8080/` 返回 **401**
-- [ ] `curl -u <user>:<pass> http://127.0.0.1:8080/` 返回 200 且能看到目录索引
-- [ ] 上传小文件返回 200，文件出现在 `/Volumes/dk2/share/web/`
-- [ ] 上传同名文件得到 `.1`、`.2` 后缀，**不覆盖**原文件
-- [ ] 上传 `../x`、`/etc/passwd`、`a\b` 等非法文件名被 400 拒绝
-- [ ] 并发两个上传时第二个返回 503（并发锁 = 1）
-- [ ] `sha256sum` 计算 boot.sh 过滤掉标记块后的值 == `state/manifest` 中的值
-- [ ] `/Volumes/dk2/.tc_tools/bin` 文件数仍 ≥ 50；`.samba4/` 仍在
-- [ ] 重启设备后 8080 自动恢复（boot.sh 标记块生效）
-
-### 7. 回退
-
-```sh
-cd /Volumes/dk2/.tc_webshare_pkg
-./deploy/uninstall.sh              # 保留 /Volumes/dk2/share/web 用户数据
-./deploy/uninstall.sh --purge-data # 仅在确实需要时删除用户数据
-```
-
-`uninstall.sh` 会：
-
-1. 按 pidfile 停 thttpd，确认 8080 关闭。
-2. 用 `sed -i ""` 只删 boot.sh 中两个标记之间（含标记）的行；
-   校验非 Web 行 sha256 与 manifest 一致。
-3. 只删 `/Volumes/dk2/.tc_webshare/`；默认保留用户数据。
-4. 验证：8080 已关；139/445 仍在听；`.tc_tools/bin` 工具仍在；
-   `.samba4/` 与共享根目录可访问；boot.sh 无标记块且校验和一致。
-5. 已卸载时再次运行输出 `already clean` 并成功退出。
-
-### 8. 安全说明
-
-- 本轮为**明文 HTTP**，仅建议在有线的可信 LAN 内使用；TLS 不在范围内。
-- Basic auth 凭据只在设备本地生成，脚本不读取本机任何口令文件。
-  仓库中的 `deploy/htpasswd.example` 是**占位符**，不是真实凭据。
-- 上传文件名仅允许 `[A-Za-z0-9._-]`，拒绝 `..`、绝对路径、反斜杠、
-  空字节与控制字符；落盘时只取 basename。
-- 目标文件用 `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW` 打开，重名加数字后缀，
-  不会覆盖已有文件，也不会跟随符号链接。
-- 上传 CGI 用 `upload.lock`（`O_CREAT|O_EXCL` + PID，退出 `unlink`）实现并发 = 1，
-  不依赖 `flock`，可在 NetBSD 6 上运行。
-- 服务与 CGI 都不写 `/`；根文件系统重启重置不会留下状态。
-
-### 9. 许可证与来源标注
-
-- 本项目源码（除下述文件外）：**GPL-3.0-or-later**，
-  Copyright (C) 2026 tc-webshare contributors。全文见 [LICENSE](LICENSE)。
-- `build/env.sh` **源自 TimeCapsuleSMB 项目的交叉构建环境**，
-  其原始版权声明与 GPL-3.0-or-later 许可头已原样保留在文件顶部，
-  包括来源注释。再次同步上游时请勿删除该头部。
-- `src/upload.c` 与 `deploy/*.sh` 为本项目实现，GPL-3.0-or-later。
-- thttpd 与 NetBSD 源码各自遵循其上游许可证；构建时从官方发行版下载，
-  本仓库不分发其源码。
-
-### 10. 变更与边界
-
-- 所有路径约定以 `docs/device-layout.md` 为准。
-- 标记块字符串在 `install.sh`、`uninstall.sh`、`docs/device-layout.md`、本 README 中完全一致：
-  - 开始：`# >>> TC_WEBSHARE BEGIN >>>`
-  - 结束：`# <<< TC_WEBSHARE END <<<`
-- 本部署包不修改 tc-toolbox、Samba 配置或数据，不连接真机，不读写任何凭据文件。
+见英文版对应章节：重点确认 8080 LISTEN、401 认证、上传落点、标记块位置、`state/boot.nonweb` 一致、硬盘卸载后 tmpfs 回退仍可用、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据，`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；GPL-3.0-or-later。
