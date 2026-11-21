@@ -11,13 +11,15 @@ touching the device.
 ### New features / 新功能
 
 - **UTF-8 folder names.** `valid_folder_name()` in `src/manage.c` now accepts
-  well-formed UTF-8 multibyte sequences in addition to `[A-Za-z0-9._-]`, so
-  names such as `家庭照片` work for both mkdir and delete. Validation is
+  well-formed UTF-8 multibyte sequences in addition to printable ASCII
+  (0x20–0x7E: spaces and common symbols are allowed; only `/`, `\` and a
+  leading dot are excluded), so names such as `家庭照片` work for both mkdir
+  and delete. Validation is
   **strict**: overlong encodings, UTF-16 surrogates (U+D800–U+DFFF), values
   above U+10FFFF, stray continuation bytes, C0/C1/DEL controls, `..`, leading
   dots, `/`, `\` and names over 200 **bytes** are still rejected. `list.cgi`
   already emits raw UTF-8 bytes under `charset=utf-8`, so JSON parses as-is.
-  **UTF-8 文件夹名**：合法多字节序列（中文等）放行；畸形序列、代理区、超范围码点、控制字符、`..`、前导点、斜杠与超 200 字节仍拒绝。
+  **UTF-8 文件夹名**：合法多字节序列（中文等）与可打印 ASCII（含空格/常见符号）放行；畸形序列、代理区、超范围码点、控制字符、`..`、前导点、斜杠与超 200 字节仍拒绝。
 - **Upload progress.** The management page now shows a progress bar and a
   percentage while `XMLHttpRequest` sends the multipart body
   (`req.upload.onprogress`). All selected files are still sent in ONE POST, so
@@ -62,6 +64,11 @@ touching the device.
 - **Not deployed to the real device in this release**; device validation is
   the operator's next step.
   本版**未连接真机部署**，待 QA 验证后再由操作者上线。
+- Documentation correction: the README (EN/中文) and these notes now describe
+  the actual name rule — printable ASCII (spaces and common symbols included)
+  plus well-formed UTF-8 — instead of the narrower `[A-Za-z0-9._-]` whitelist
+  that applies only to uploads. Code, binaries and hashes are unchanged.
+  文档修正：README 中英版本条说明已与实现对齐（可打印 ASCII 含空格/常见符号 + 合法 UTF-8），不再沿用仅适用于上传的窄白名单；代码、二进制与哈希均未改动。
 
 ## v1.0.3 — 2026-11-21 — 网页管理界面 / Web management UI
 

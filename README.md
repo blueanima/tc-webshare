@@ -207,12 +207,13 @@ Endpoints (all behind the same docroot `.htpasswd`):
 | `/delete.cgi` | POST `name=...` (form-urlencoded) or GET query | delete one top-level file or empty directory |
 | `/upload.cgi` | POST multipart | existing streaming uploader |
 
-Names for mkdir/delete accept ASCII `[A-Za-z0-9._-]` **and well-formed UTF-8
-multibyte characters** (e.g. `家庭照片`), up to **200 bytes**, no leading dot,
-no `/`, `\`, spaces or control characters. `..` is rejected and existing
-mkdir names return 409. Malformed UTF-8 (overlong encodings, surrogates,
-values above U+10FFFF) is rejected too, so no byte sequence can bypass the
-basename checks. `list.cgi` returns raw UTF-8 in a `charset=utf-8` JSON body,
+Names for mkdir/delete accept **printable ASCII (0x20–0x7E)** — spaces and
+common symbols such as `! @ # $ % & ' ( ) + , ; = [ ]` are allowed — **plus
+well-formed UTF-8 multibyte characters** (e.g. `家庭照片`), up to **200 bytes**.
+Rejected: `/`, `\`, any leading dot (which covers `.` and `..`), C0/C1/DEL
+control bytes and malformed UTF-8. Existing mkdir names return 409. Malformed
+UTF-8 (overlong encodings, surrogates, values above U+10FFFF) is rejected too,
+so no byte sequence can bypass the basename checks. `list.cgi` returns raw UTF-8 in a `charset=utf-8` JSON body,
 which `JSON.parse` handles directly. Browser `FormData` uploads do not send
 `Expect: 100-continue`, so the curl-only `-H 'Expect:'` workaround is not
 needed in the web UI.
@@ -384,7 +385,7 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 | `/delete.cgi` | POST 表单 `name=...` 或 GET query | 删除一个顶层文件或空目录 |
 | `/upload.cgi` | POST multipart | 原有流式上传 |
 
-新建/删除的名称接受 ASCII `[A-Za-z0-9._-]` **以及合法 UTF-8 多字节字符**（如 `家庭照片`），最长 **200 字节**；不允许前导点、斜杠、反斜杠、空格及控制字符，`..` 被拒绝，重名建文件夹返回 409。畸形 UTF-8（overlong、代理区、超出 U+10FFFF）同样拒绝，任何字节序列都无法绕过 basename 检查。`list.cgi` 以 `charset=utf-8` 返回原始 UTF-8 JSON，`JSON.parse` 可直接解析。浏览器 `FormData` 不会发送 `Expect: 100-continue`，因此网页上传不需要 curl 的 `-H 'Expect:'` 补丁。
+新建/删除的名称接受**可打印 ASCII 字符（0x20–0x7E，含空格与 `! @ # $ % & ' ( ) + , ; = [ ]` 等常见符号）**以及合法 UTF-8 多字节字符（如 `家庭照片`），最长 **200 字节**；仅拒绝 `/`、`\`、前导点（含 `.`、`..`）、C0/C1/DEL 控制字符与畸形 UTF-8，空格和常见符号是允许的。重名建文件夹返回 409。畸形 UTF-8（overlong、代理区、超出 U+10FFFF）同样拒绝，任何字节序列都无法绕过 basename 检查。`list.cgi` 以 `charset=utf-8` 返回原始 UTF-8 JSON，`JSON.parse` 可直接解析。浏览器 `FormData` 不会发送 `Expect: 100-continue`，因此网页上传不需要 curl 的 `-H 'Expect:'` 补丁。
 
 **删除范围刻意收窄且不可恢复**：仅作用于 `TC_SHARE_DIR` 顶层；拒绝符号链接；普通文件用 `unlink()`，目录只用 `rmdir()`（**仅空目录，绝不递归**）；点文件与 `.htpasswd` / `.tc-webshare-index.html` 两个程序文件无法被命名；界面会二次确认。没有回收站、没有撤销，重要数据请自行备份。返回码：`200 {"ok":true,...}`、`400` 非法名、`403` 软链/特殊文件、`404` 不存在、`409` 目录非空、`500` 其他错误。
 
