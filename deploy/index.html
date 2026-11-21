@@ -31,8 +31,16 @@ th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line);font-s
 th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
 td.name{word-break:break-all}
 td.size,td.time{white-space:nowrap;color:var(--muted)}
+td.op{white-space:nowrap}
 a{color:var(--accent);text-decoration:none}
 .empty{padding:24px;text-align:center;color:var(--muted)}
+[hidden]{display:none !important}
+.progress{display:flex;align-items:center;gap:10px;margin-top:10px}
+.progress-track{flex:1;max-width:420px;height:10px;background:#e4e7ec;border-radius:999px;overflow:hidden}
+.progress-fill{height:100%;width:0;background:var(--accent);transition:width .12s linear}
+.progress-text{font-size:12px;color:var(--muted);min-width:38px}
+button.mini{padding:4px 9px;font-size:12px;margin-left:10px}
+button.danger{background:var(--danger)}
 </style>
 </head>
 <body>
@@ -53,7 +61,7 @@ a{color:var(--accent);text-decoration:none}
       <div class="field">
         <label for="folder">新建文件夹</label>
         <div class="row">
-          <input type="text" id="folder" placeholder="名称：字母/数字/._-" maxlength="200">
+          <input type="text" id="folder" placeholder="名称：字母/数字/中文/._-" maxlength="200" title="最多 200 字节（中文约 66 字）；不能以 . 开头，不能含 / 或 \">
           <button id="mkdirBtn" type="button">创建</button>
         </div>
       </div>
@@ -63,6 +71,10 @@ a{color:var(--accent);text-decoration:none}
       </div>
     </div>
     <div class="status" id="status"></div>
+    <div class="progress" id="progressWrap" hidden>
+      <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+      <span class="progress-text" id="progressText">0%</span>
+    </div>
   </section>
 
   <section class="panel">
@@ -80,6 +92,23 @@ a{color:var(--accent);text-decoration:none}
   var rowsEl = document.getElementById('rows');
   var fileEl = document.getElementById('file');
   var folderEl = document.getElementById('folder');
+  var uploadBtn = document.getElementById('uploadBtn');
+  var progressWrap = document.getElementById('progressWrap');
+  var progressFill = document.getElementById('progressFill');
+  var progressText = document.getElementById('progressText');
+
+  function showProgress(pct) {
+    var value = Math.max(0, Math.min(100, Math.round(pct)));
+    progressWrap.hidden = false;
+    progressFill.style.width = value + '%';
+    progressText.textContent = value + '%';
+  }
+
+  function hideProgress() {
+    progressWrap.hidden = true;
+    progressFill.style.width = '0%';
+    progressText.textContent = '0%';
+  }
 
   function status(text, isError) {
     statusEl.textContent = text || '';
@@ -126,17 +155,44 @@ a{color:var(--accent);text-decoration:none}
       time.className = 'time';
       time.textContent = (e.mtime || '').replace('T',' ').replace('Z','');
       var op = document.createElement('td');
+      op.className = 'op';
       if (!e.dir) {
         var dl = document.createElement('a');
         dl.href = '/' + encodeURIComponent(e.name);
         dl.textContent = '下载';
         op.appendChild(dl);
-      } else {
-        op.textContent = '—';
       }
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'mini danger';
+      del.textContent = '删除';
+      del.title = e.dir ? '仅可删除空文件夹' : '此操作不可恢复';
+      del.onclick = (function (entryName, entryIsDir) {
+        return function () { deleteEntry(entryName, entryIsDir); };
+      })(e.name, e.dir);
+      op.appendChild(del);
       tr.appendChild(nameCell); tr.appendChild(size); tr.appendChild(time); tr.appendChild(op);
       rowsEl.appendChild(tr);
     });
+  }
+
+  function deleteEntry(name, isDir) {
+    var question = isDir
+      ? '确认删除文件夹「' + name + '」？（仅空文件夹可删除）'
+      : '确认删除文件「' + name + '」？此操作不可恢复。';
+    if (!window.confirm(question)) return;
+    var req = new XMLHttpRequest();
+    req.open('POST', '/delete.cgi', true);
+    req.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    req.onreadystatechange = function () {
+      if (req.readyState !== 4) return;
+      if (req.status === 200) { status('已删除：' + name); refresh(); return; }
+      if (req.status === 401) { status('会话认证已失效，请重新输入用户名/口令。', true); return; }
+      if (req.status === 404) { status('删除失败：条目不存在', true); return; }
+      if (req.status === 409) { status('删除失败：文件夹非空，请先清空内容', true); return; }
+      status('删除失败：HTTP ' + req.status + ' ' + req.responseText, true);
+    };
+    req.send('name=' + encodeURIComponent(name));
   }
 
   function refresh() {
@@ -169,17 +225,29 @@ a{color:var(--accent);text-decoration:none}
     req.send('name=' + encodeURIComponent(name));
   };
 
-  document.getElementById('uploadBtn').onclick = function () {
+  uploadBtn.onclick = function () {
     if (!fileEl.files || !fileEl.files.length) { status('请先选择文件', true); return; }
+    /* All selected files go into one POST, so one progress bar reports the
+     * progress of the whole batch (accurate and no extra requests). */
     var fd = new FormData();
     for (var i = 0; i < fileEl.files.length; i++) fd.append('file', fileEl.files[i]);
     var req = new XMLHttpRequest();
     req.open('POST', '/upload.cgi', true);
+    /* Must be set after open() and before send(): progress is for the
+     * request body, i.e. the complete multipart batch. */
+    req.upload.onprogress = function (e) {
+      if (e.lengthComputable && e.total > 0) showProgress(e.loaded / e.total * 100);
+    };
     req.onreadystatechange = function () {
       if (req.readyState !== 4) return;
+      hideProgress();
+      uploadBtn.disabled = false;
       if (req.status === 200) { status('上传完成：' + req.responseText); fileEl.value = ''; refresh(); }
       else { status('上传失败：HTTP ' + req.status + ' ' + req.responseText, true); }
     };
+    uploadBtn.disabled = true;
+    showProgress(0);
+    status('正在上传…');
     req.send(fd);
   };
 

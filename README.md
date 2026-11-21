@@ -56,10 +56,11 @@ Browser (LAN) --HTTP :8080--> bozohttpd (static ELF, slashdir=<SHARE_DIR>)
                                                                |                  -> upload.lock (O_EXCL, concurrency=1)
                                                                |                  -> <SHARE_DIR>/<basename>
                                                                |-- /list.cgi   -> static manage.bin (JSON listing)
-                                                               `-- /mkdir.cgi  -> static manage.bin (mkdir)
+                                                               |-- /mkdir.cgi  -> static manage.bin (mkdir)
+                                                               `-- /delete.cgi -> static manage.bin (delete, top-level only)
 ```
 
-**Why a unified dispatcher:** bozohttpd's `-C .cgi` maps one suffix to **one** handler; it cannot give upload/list/mkdir separate handlers. Switching to `-c <cgibin dir>` would require a second `.htpasswd` and put program files next to user data. We therefore keep `-C .cgi` (which preserves the single docroot `.htpasswd` auth for every `.cgi` URL) and generate a `/bin/sh` dispatcher in managed Flash `bin/`. It restores `TC_SHARE_DIR` / `TC_STATE_DIR` (bozohttpd rebuilds the CGI environment) and routes by `SCRIPT_NAME`. `.htpasswd` is not recursive, but `-C` keeps every action inside the docroot, so **one** link protects GET `/` and all POSTs.
+**Why a unified dispatcher:** bozohttpd's `-C .cgi` maps one suffix to **one** handler; it cannot give upload/list/mkdir/delete separate handlers. Switching to `-c <cgibin dir>` would require a second `.htpasswd` and put program files next to user data. We therefore keep `-C .cgi` (which preserves the single docroot `.htpasswd` auth for every `.cgi` URL) and generate a `/bin/sh` dispatcher in managed Flash `bin/`. It restores `TC_SHARE_DIR` / `TC_STATE_DIR` (bozohttpd rebuilds the CGI environment) and routes by `SCRIPT_NAME`. `.htpasswd` is not recursive, but `-C` keeps every action inside the docroot, so **one** link protects GET `/` and all POSTs.
 
 The management homepage is a **program file**: its master copy lives in managed Flash `etc/index.html`, and a hidden copy (`<SHARE_DIR>/.tc-webshare-index.html`) is published into the docroot and served as the default index via bozohttpd `-x`. `-H` hides it from the generated directory listing. Uninstall deletes exactly that file; all other docroot files are user data and are never touched.
 
@@ -82,7 +83,7 @@ The management homepage is a **program file**: its master copy lives in managed 
 │   ├── fetch_src.sh           idempotent NetBSD source download/unpack; reuses /wb-build/src
 │   └── build_thttpd.sh        historical name; builds httpd + upload.cgi + manage.cgi
 ├── src/upload.c               streaming multipart upload CGI (unchanged)
-├── src/manage.c               list/mkdir CGI (static, JSON, path whitelist)
+├── src/manage.c               list/mkdir/delete CGI (static, JSON, strict UTF-8 basename whitelist)
 ├── deploy/
 │   ├── common.sh              dependency-light on-device helpers
 │   ├── install.sh / uninstall.sh
@@ -184,13 +185,18 @@ curl -u admin:'<password>' -H 'Expect:' -F 'file=@/path/to/test.txt' \
 # Failed when curl sends the default "Expect: 100-continue".
 ```
 
-#### Web management UI (v1.0.3)
+#### Web management UI (v1.0.4)
 
 Open `http://<device-lan-ip>:8080/` in a browser and pass the Basic auth
 dialog. The hidden management homepage is served automatically; the top
-toolbar offers **file upload** (multiple files), **new folder**, and refresh.
-The table below shows top-level entries with size, UTC mtime, download link,
-and directory markers, rendered from `/list.cgi` (JSON) without any CDN.
+toolbar offers **file upload** (multiple files, with a live progress bar),
+**new folder**, and refresh. The table below shows top-level entries with
+size, UTC mtime, download link, a **delete** button and directory markers,
+rendered from `/list.cgi` (JSON) without any CDN.
+
+All selected files are posted in one multipart request; the progress bar
+therefore reports the **whole batch** (`req.upload.onprogress`), and the
+upload button is disabled until the response arrives.
 
 Endpoints (all behind the same docroot `.htpasswd`):
 
@@ -198,13 +204,26 @@ Endpoints (all behind the same docroot `.htpasswd`):
 | --- | --- | --- |
 | `/list.cgi` | GET | JSON list of top-level entries; dotfiles skipped |
 | `/mkdir.cgi` | POST `name=...` (form-urlencoded) or GET query | create a folder |
+| `/delete.cgi` | POST `name=...` (form-urlencoded) or GET query | delete one top-level file or empty directory |
 | `/upload.cgi` | POST multipart | existing streaming uploader |
 
-Folder names use the same whitelist as uploaded filenames: `[A-Za-z0-9._-]`,
-max 200 chars, no leading dot, no `/`, `\`, spaces or control characters;
-`..` is rejected and existing names return 409. Browser `FormData` uploads do
-not send `Expect: 100-continue`, so the curl-only `-H 'Expect:'` workaround is
-not needed in the web UI.
+Names for mkdir/delete accept ASCII `[A-Za-z0-9._-]` **and well-formed UTF-8
+multibyte characters** (e.g. `家庭照片`), up to **200 bytes**, no leading dot,
+no `/`, `\`, spaces or control characters. `..` is rejected and existing
+mkdir names return 409. Malformed UTF-8 (overlong encodings, surrogates,
+values above U+10FFFF) is rejected too, so no byte sequence can bypass the
+basename checks. `list.cgi` returns raw UTF-8 in a `charset=utf-8` JSON body,
+which `JSON.parse` handles directly. Browser `FormData` uploads do not send
+`Expect: 100-continue`, so the curl-only `-H 'Expect:'` workaround is not
+needed in the web UI.
+
+**Deletion is deliberately narrow and irreversible.** It works only on the
+`TC_SHARE_DIR` top level: symlinks are refused, regular files use `unlink()`,
+directories use `rmdir()` (empty only, **never recursive**), dotfiles and the
+two program files `.htpasswd` / `.tc-webshare-index.html` can never be named,
+and the UI asks for confirmation. There is no trash and no undo — keep backups.
+Responses: `200 {"ok":true,...}`, `400` bad name, `403` symlink/special file,
+`404` missing, `409` directory not empty, `500` other errors.
 
 ### 7. Verification checklist
 
@@ -229,7 +248,9 @@ Removes the marker block, verifies boot.sh against the install-time snapshot, st
 
 ### 9. Security notes
 
-Plaintext HTTP on a trusted wired LAN only; TLS is out of scope. `upload.c` whitelists `[A-Za-z0-9._-]` basenames, uses `O_EXCL|O_NOFOLLOW`, never overwrites, and serialises uploads with `upload.lock`. Credentials are supplied as a pre-computed crypt(3) hash; `htpasswd.example` is a placeholder. No plaintext password or credential file is read by this repository.
+Plaintext HTTP on a trusted wired LAN only; TLS is out of scope. `upload.c` whitelists `[A-Za-z0-9._-]` basenames, uses `O_EXCL|O_NOFOLLOW`, never overwrites, and serialises uploads with `upload.lock`. `manage.c` applies strict RFC 3629 UTF-8 validation to mkdir/delete names (valid Chinese names are allowed; malformed sequences, controls, separators, `..`, leading dots and >200-byte names are refused), and deletion is limited to a validated top-level basename: `lstat()` rejects symlinks, `rmdir()` refuses non-empty directories, no recursion is performed, and program/dotfiles are unreachable by name. Deletions are permanent. Credentials are supplied as a pre-computed crypt(3) hash; `htpasswd.example` is a placeholder. No plaintext password or credential file is read by this repository.
+
+**v1.0.4 status:** built and tested locally only; not yet deployed to the real device. v1.0.3 remains the version validated on hardware (see below).
 
 ### 10. License
 
@@ -290,7 +311,7 @@ GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSM
 - CGI、目录索引、Basic auth 功能等价；
 - 参数与 thttpd 及旧版文档都不同（已查 `main.c` / `bozohttpd.8`）：`-b` 后台、`-I <port>` 端口（**不是** `-p`，那是 public_html）、docroot 是**位置参数**（`-d` 是 debug）、`-C .cgi <handler>` 后缀映射 CGI、`-X` 索引（默认关）、`-H` 隐藏点文件、`-P <pidfile>`、`-U <user>` 切用户（本包不用）。**没有 `-D` / `-g` 选项。**
 
-**为何用统一分发器**：bozohttpd 的 `-C .cgi` 只能把一个后缀映射到**一个** handler，不能给 upload/list/mkdir 分别配置。改用 `-c <cgibin目录>` 则需要第二份 `.htpasswd`，还会把程序文件混进用户数据目录。因此保留 `-C .cgi`（所有 `.cgi` URL 都在 docroot，受同一份 `.htpasswd` 保护），由 managed Flash `bin/` 中生成的 `/bin/sh` 分发器补回 `TC_SHARE_DIR` / `TC_STATE_DIR`（bozohttpd 会重建 CGI 环境），再按 `SCRIPT_NAME` 路由到三个静态二进制。
+**为何用统一分发器**：bozohttpd 的 `-C .cgi` 只能把一个后缀映射到**一个** handler，不能给 upload/list/mkdir/delete 分别配置。改用 `-c <cgibin目录>` 则需要第二份 `.htpasswd`，还会把程序文件混进用户数据目录。因此保留 `-C .cgi`（所有 `.cgi` URL 都在 docroot，受同一份 `.htpasswd` 保护），由 managed Flash `bin/` 中生成的 `/bin/sh` 分发器补回 `TC_SHARE_DIR` / `TC_STATE_DIR`（bozohttpd 会重建 CGI 环境），再按 `SCRIPT_NAME` 路由到三个静态二进制。
 
 管理首页是**程序文件**：主副本放在 managed Flash `etc/index.html`，并把隐藏副本 `<SHARE_DIR>/.tc-webshare-index.html` 发布到 docroot，用 bozohttpd `-x` 作为默认首页；`-H` 让它不出现在自动目录索引里。卸载只精确删除该文件，docroot 中其他文件一律视为用户数据。
 
@@ -348,9 +369,11 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 
 **Flash 是同步写入、极慢**：用 `cp` 写 656KB 的 `httpd` 曾耗时约 20 分钟并导致设备失联；安装脚本已改用 `dd bs=64k`，真机实测约 30 秒。boot.sh 的临时文件放在 16MB RAM tmpfs，绝不写 Flash。上传测试必须带 `-H 'Expect:'`，否则 bozohttpd 会因默认 `Expect: 100-continue` 返回 417。
 
-#### 网页管理界面（v1.0.3）
+#### 网页管理界面（v1.0.4）
 
-浏览器打开 `http://<设备IP>:8080/` 并通过 Basic auth 后，会自动看到隐藏的管理首页：顶部工具栏提供**多文件上传**、**新建文件夹**、刷新；下方表格显示顶层文件名、大小、UTC 修改时间、下载链接与目录标记，由 `/list.cgi`（JSON）渲染，完全离线、无外部 CDN。
+浏览器打开 `http://<设备IP>:8080/` 并通过 Basic auth 后，会自动看到隐藏的管理首页：顶部工具栏提供**多文件上传**（带实时进度条）、**新建文件夹**、刷新；下方表格显示顶层文件名、大小、UTC 修改时间、下载链接、**删除**按钮与目录标记，由 `/list.cgi`（JSON）渲染，完全离线、无外部 CDN。
+
+所选多个文件仍一次性 POST，因此进度条显示**整批**上传进度（`req.upload.onprogress`），上传期间禁用上传按钮，完成或失败后自动隐藏。
 
 接口（均受 docroot 同一份 `.htpasswd` 保护）：
 
@@ -358,13 +381,18 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 | --- | --- | --- |
 | `/list.cgi` | GET | 顶层条目 JSON 列表，跳过所有点文件 |
 | `/mkdir.cgi` | POST 表单 `name=...` 或 GET query | 新建文件夹 |
+| `/delete.cgi` | POST 表单 `name=...` 或 GET query | 删除一个顶层文件或空目录 |
 | `/upload.cgi` | POST multipart | 原有流式上传 |
 
-文件夹名与上传文件使用同一白名单：`[A-Za-z0-9._-]`、最长 200 字符、不允许前导点、斜杠、反斜杠、空格及控制字符，`..` 被拒绝，重名返回 409。浏览器 `FormData` 不会发送 `Expect: 100-continue`，因此网页上传不需要 curl 的 `-H 'Expect:'` 补丁。
+新建/删除的名称接受 ASCII `[A-Za-z0-9._-]` **以及合法 UTF-8 多字节字符**（如 `家庭照片`），最长 **200 字节**；不允许前导点、斜杠、反斜杠、空格及控制字符，`..` 被拒绝，重名建文件夹返回 409。畸形 UTF-8（overlong、代理区、超出 U+10FFFF）同样拒绝，任何字节序列都无法绕过 basename 检查。`list.cgi` 以 `charset=utf-8` 返回原始 UTF-8 JSON，`JSON.parse` 可直接解析。浏览器 `FormData` 不会发送 `Expect: 100-continue`，因此网页上传不需要 curl 的 `-H 'Expect:'` 补丁。
+
+**删除范围刻意收窄且不可恢复**：仅作用于 `TC_SHARE_DIR` 顶层；拒绝符号链接；普通文件用 `unlink()`，目录只用 `rmdir()`（**仅空目录，绝不递归**）；点文件与 `.htpasswd` / `.tc-webshare-index.html` 两个程序文件无法被命名；界面会二次确认。没有回收站、没有撤销，重要数据请自行备份。返回码：`200 {"ok":true,...}`、`400` 非法名、`403` 软链/特殊文件、`404` 不存在、`409` 目录非空、`500` 其他错误。
 
 ### 7. 验证清单 / 8. 回退 / 9. 安全 / 10. 许可
 
-见英文版对应章节：重点确认 8080 LISTEN、401 认证、`/upload.cgi` 上传落点（curl 必须加 `-H 'Expect:'`）、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、开机后 boot hook 通过 acp 重新挂载硬盘并继续使用 `/Volumes/dk2/share/web`（失败时明确告警并回退 Flash 小容量数据目录）、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；GPL-3.0-or-later。
+见英文版对应章节：重点确认 8080 LISTEN、401 认证、`/upload.cgi` 上传落点（curl 必须加 `-H 'Expect:'`）、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、开机后 boot hook 通过 acp 重新挂载硬盘并继续使用 `/Volumes/dk2/share/web`（失败时明确告警并回退 Flash 小容量数据目录）、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；`manage.c` 对新建/删除名称执行严格 RFC 3629 UTF-8 校验（合法中文放行，畸形序列、控制字符、分隔符、`..`、前导点、超 200 字节拒绝）；删除仅限合法顶层 basename：`lstat()` 拒绝软链、`rmdir()` 拒绝非空目录、不递归、程序文件与点文件不可命名，且删除不可撤销。GPL-3.0-or-later。
+
+**v1.0.4 状态**：仅在本机构建与测试，**尚未真机部署**；硬件上已验证的版本仍是 v1.0.3（见下）。
 
 ### 11. 发布说明 — 真机验证结果（v1.0.2）
 

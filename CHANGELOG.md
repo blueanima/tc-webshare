@@ -1,5 +1,68 @@
 # Changelog / 变更记录
 
+## v1.0.4 — 2026-11-21 — 中文名、上传进度、删除 / Chinese names, upload progress, delete
+
+Based on hands-on browser feedback: Chinese folder names were rejected, uploads
+gave no progress feedback, and there was no way to delete anything. This release
+closes all three gaps without weakening the single-`.htpasswd` auth model or
+touching the device.
+用户试用网页后反馈三点：中文文件夹名被拒、上传没有进度、只能传不能删。本版补齐三项能力，不削弱单份 `.htpasswd` 认证，也不连接真机。
+
+### New features / 新功能
+
+- **UTF-8 folder names.** `valid_folder_name()` in `src/manage.c` now accepts
+  well-formed UTF-8 multibyte sequences in addition to `[A-Za-z0-9._-]`, so
+  names such as `家庭照片` work for both mkdir and delete. Validation is
+  **strict**: overlong encodings, UTF-16 surrogates (U+D800–U+DFFF), values
+  above U+10FFFF, stray continuation bytes, C0/C1/DEL controls, `..`, leading
+  dots, `/`, `\` and names over 200 **bytes** are still rejected. `list.cgi`
+  already emits raw UTF-8 bytes under `charset=utf-8`, so JSON parses as-is.
+  **UTF-8 文件夹名**：合法多字节序列（中文等）放行；畸形序列、代理区、超范围码点、控制字符、`..`、前导点、斜杠与超 200 字节仍拒绝。
+- **Upload progress.** The management page now shows a progress bar and a
+  percentage while `XMLHttpRequest` sends the multipart body
+  (`req.upload.onprogress`). All selected files are still sent in ONE POST, so
+  the bar reports the whole batch; this keeps the uploader unchanged and avoids
+  extra requests. The bar is hidden again on completion or failure, and the
+  upload button is disabled during transfer. Pure native JS/CSS, no CDN.
+  **上传进度条**：按整批显示（多文件一次 POST），完成/失败自动隐藏，上传期间禁用按钮；无外部依赖。
+- **Delete.** New `/delete.cgi` action in `manage.bin`, routed by the generated
+  `cgi_dispatch.sh` and exposed as a confirm()-guarded "删除" button on every
+  row. It reads `name` from the same form/query source as mkdir and returns
+  JSON: `200 {"ok":true,...}`, `400` invalid name, `403` symlink/special file,
+  `404` missing, `409` non-empty directory, `500` other errors.
+  **删除功能**：新增 `/delete.cgi` 与每行确认删除按钮；复用同名校验，JSON 状态码覆盖 400/403/404/409/500。
+
+### Security boundary of delete / 删除的安全边界
+
+- Top level of `TC_SHARE_DIR` only: `name` is a validated basename with no
+  separators or `..`, then joined as `SHARE_DIR/name`.
+- `lstat()` first; symlinks are **never** followed or deleted. `unlink()` only
+  removes the link itself even under a race, and `rmdir()` fails on a symlink.
+- Regular files use `unlink()`; directories use `rmdir()` only — **empty
+  directories only, never recursive**, so user data cannot be wiped.
+- Dotfiles (including `.htpasswd` and `.tc-webshare-index.html`) are rejected
+  by name validation, with an explicit second check for the two program files.
+- Deletion is **irreversible**: there is no trash or undo. The UI asks for
+  confirmation; keep backups of anything important.
+- 仅顶层、仅空目录、绝不递归；拒绝软链与全部点文件；删除不可恢复，请先确认。
+
+### Verification / 验证
+
+- `gcc -Wall -Wextra -fsyntax-only src/manage.c`: no warnings; `sh -n` on all
+  shell scripts: passed.
+- Docker `tc_wb` cross-build: `manage.cgi` compiled with the verified
+  `armv4--netbsdelf-eabi-gcc --sysroot=...` toolchain and checked with both
+  `nbfile` (static ARM ELF) and `objdump -p` (no INTERP/DYNAMIC).
+- Native functional tests: valid Chinese/ASCII names accepted; malformed
+  UTF-8, overlong encodings, surrogates, out-of-range code points, `..`,
+  leading dots, separators, control bytes and 201-byte names rejected;
+  delete refuses symlinks, non-empty directories, program files and traversal
+  names, and removes a top-level file / empty directory with the expected
+  status codes. Dispatcher routes all four CGI names correctly.
+- **Not deployed to the real device in this release**; device validation is
+  the operator's next step.
+  本版**未连接真机部署**，待 QA 验证后再由操作者上线。
+
 ## v1.0.3 — 2026-11-21 — 网页管理界面 / Web management UI
 
 The device served only bozohttpd's bare directory index. This release adds a

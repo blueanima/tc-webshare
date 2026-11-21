@@ -1,17 +1,26 @@
 /*
- * manage.c - list/mkdir CGI for tc-webshare on AirPort Time Capsule.
+ * manage.c - list/mkdir/delete CGI for tc-webshare on AirPort Time Capsule.
  *
- * One static binary serves two endpoints through the single "-C .cgi"
+ * One static binary serves three endpoints through the single "-C .cgi"
  * handler mapping.  The action is selected from SCRIPT_NAME:
  *   /list.cgi   -> JSON array of the top-level entries of TC_SHARE_DIR
  *   /mkdir.cgi  -> create a directory in TC_SHARE_DIR (name from query or
  *                  application/x-www-form-urlencoded POST body)
+ *   /delete.cgi -> remove ONE top-level file or EMPTY directory in
+ *                  TC_SHARE_DIR (name from the same sources as mkdir)
  *
  * Security rules (same strength as upload.c):
- *   - only basenames matching [A-Za-z0-9._-] are accepted for mkdir;
- *     ".", "..", leading dots, absolute paths and separators are rejected.
- *   - listing is non-recursive and skips all dotfiles (including .htpasswd
- *     and the generated hidden homepage).
+ *   - names may use ASCII [A-Za-z0-9._-] plus well-formed UTF-8 multibyte
+ *     sequences (Chinese folder names work).  ".", "..", leading dots,
+ *     path separators (/ and \), NUL/C0/C1/DEL controls, malformed UTF-8
+ *     (overlong encodings, surrogates, values above U+10FFFF) and names
+ *     longer than MAX_NAME bytes are all rejected.
+ *   - deletion stays in the SHARE_DIR top level: lstat() never follows
+ *     symlinks, only regular files (unlink) and directories (rmdir, empty
+ *     only) are accepted.  No recursion, so user data cannot be wiped.
+ *   - the program files .htpasswd and .tc-webshare-index.html (and every
+ *     other dotfile) can never be named, hence never deleted.
+ *   - listing is non-recursive and skips all dotfiles.
  *   - JSON strings are escaped; no shell is involved.
  *
  * Build (inside the cross-build container, with --sysroot):
@@ -177,22 +186,97 @@ static int form_value(const char *buf, const char *key, char *out, size_t out_si
     return -1;
 }
 
-static int valid_folder_name(const char *name) {
+/* Is BYTE a UTF-8 continuation byte (0x80..0xBF)? */
+static int is_utf8_cont(unsigned char byte) {
+    return (byte & 0xc0) == 0x80;
+}
+
+/*
+ * Strict UTF-8 validation of exactly N bytes.  We do not merely allow bytes
+ * >= 0x80: every sequence is checked against the RFC 3629 rules so that a
+ * malformed byte string cannot smuggle an ASCII separator or a traversal
+ * component past the basename checks below.
+ *
+ * Rejected: stray continuations, 0xC0/0xC1 and 0xF5..0xFF lead bytes,
+ * overlong 2/3/4-byte forms, UTF-16 surrogates (U+D800..U+DFFF) and code
+ * points above U+10FFFF.  C0 controls, DEL and C1 controls (U+0080..U+009F)
+ * are rejected as well; ordinary ASCII is left for the caller to filter.
+ */
+static int valid_utf8_bytes(const char *text, size_t n) {
     size_t i = 0;
+
+    while (i < n) {
+        unsigned char c = (unsigned char)text[i];
+
+        if (c < 0x80) {
+            if (c < 0x20 || c == 0x7f) return 0;   /* NUL/C0 controls, DEL. */
+            i++;
+            continue;
+        }
+        if (c >= 0xc2 && c <= 0xdf) {              /* 2 bytes: U+0080..U+07FF. */
+            unsigned char c1 = 0;
+            if (i + 1 >= n) return 0;
+            c1 = (unsigned char)text[i + 1];
+            if (!is_utf8_cont(c1)) return 0;
+            if (c == 0xc2 && c1 <= 0x9f) return 0; /* C1 controls. */
+            i += 2;
+            continue;
+        }
+        if (c >= 0xe0 && c <= 0xef) {              /* 3 bytes: U+0800..U+FFFF. */
+            unsigned char c1 = 0;
+            unsigned char c2 = 0;
+            if (i + 2 >= n) return 0;
+            c1 = (unsigned char)text[i + 1];
+            c2 = (unsigned char)text[i + 2];
+            if (!is_utf8_cont(c1) || !is_utf8_cont(c2)) return 0;
+            if (c == 0xe0 && c1 < 0xa0) return 0;  /* Overlong encoding. */
+            if (c == 0xed && c1 > 0x9f) return 0;  /* UTF-16 surrogate. */
+            i += 3;
+            continue;
+        }
+        if (c >= 0xf0 && c <= 0xf4) {              /* 4 bytes: U+10000..U+10FFFF. */
+            unsigned char c1 = 0;
+            unsigned char c2 = 0;
+            unsigned char c3 = 0;
+            if (i + 3 >= n) return 0;
+            c1 = (unsigned char)text[i + 1];
+            c2 = (unsigned char)text[i + 2];
+            c3 = (unsigned char)text[i + 3];
+            if (!is_utf8_cont(c1) || !is_utf8_cont(c2) || !is_utf8_cont(c3)) {
+                return 0;
+            }
+            if (c == 0xf0 && c1 < 0x90) return 0;  /* Overlong encoding. */
+            if (c == 0xf4 && c1 > 0x8f) return 0;  /* Above U+10FFFF. */
+            i += 4;
+            continue;
+        }
+        return 0;   /* 0x80..0xBF stray continuation, 0xC0/0xC1, 0xF5..0xFF. */
+    }
+    return 1;
+}
+
+/*
+ * Basename policy shared by mkdir and delete.  ASCII separators are checked
+ * explicitly (they can only occur as whole ASCII bytes in well-formed
+ * UTF-8), the full "." and ".." strings and all leading dots are refused,
+ * and the remaining bytes must be well-formed UTF-8 without controls.
+ */
+static int valid_folder_name(const char *name) {
     size_t n = 0;
 
     if (name == NULL) return 0;
     n = strlen(name);
     if (n == 0 || n > MAX_NAME) return 0;
-    if (name[0] == '.' || name[0] == '/' || name[0] == '\\') return 0;
-    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return 0;
-    for (i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)name[i];
-        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                 (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
-        if (!ok) return 0;
-    }
-    return 1;
+    if (name[0] == '.') return 0;                  /* Also covers "." / "..". */
+    if (strchr(name, '/') != NULL || strchr(name, '\\') != NULL) return 0;
+    return valid_utf8_bytes(name, n);
+}
+
+/* Program files must never be deletable; valid_folder_name already rejects
+ * them because they are dotfiles.  Keep this explicit as a second barrier. */
+static int is_program_file(const char *name) {
+    return strcmp(name, ".htpasswd") == 0 ||
+           strcmp(name, ".tc-webshare-index.html") == 0;
 }
 
 static void json_time(char *dst, size_t dst_size, time_t value) {
@@ -338,6 +422,72 @@ static int action_mkdir(void) {
     return 0;
 }
 
+/*
+ * Delete exactly one top-level entry of SHARE_DIR.  The name goes through
+ * the same validator as mkdir, so it is always a basename (no separators,
+ * no "..", no leading dot, no malformed UTF-8).  lstat() is used so that a
+ * symlink is recognised and refused instead of being followed; unlink() of
+ * a symlink would only remove the link anyway, and rmdir() of one fails.
+ * Directories are removed with rmdir() only: never recurse into user data.
+ */
+static int action_delete(void) {
+    char input[MAX_BODY + 1];
+    char name[MAX_NAME + 1];
+    char path[PATH_MAX];
+    struct stat sb;
+    const char *query = NULL;
+    const char *type = NULL;
+    int rc = 0;
+
+    type = getenv("CONTENT_TYPE");
+    if (type != NULL && strncasecmp(type, "application/x-www-form-urlencoded", 33) == 0) {
+        rc = read_body(input, sizeof(input));
+        if (rc != 0) return cgi_fail(400, "invalid request body");
+    } else {
+        query = getenv("QUERY_STRING");
+        (void)snprintf(input, sizeof(input), "%s", (query != NULL) ? query : "");
+    }
+
+    if (form_value(input, "name", name, sizeof(name)) != 0) {
+        return cgi_fail(400, "missing or malformed 'name' parameter");
+    }
+    if (!valid_folder_name(name) || is_program_file(name)) {
+        return cgi_fail(400, "name rejected by security policy");
+    }
+
+    (void)snprintf(path, sizeof(path), "%s/%s", g_share_dir, name);
+    if (lstat(path, &sb) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) return cgi_fail(404, "not found");
+        return cgi_fail(500, "cannot stat entry");
+    }
+    if (S_ISLNK(sb.st_mode)) {
+        return cgi_fail(403, "symlinks cannot be deleted");
+    }
+
+    if (S_ISDIR(sb.st_mode)) {
+        if (rmdir(path) != 0) {
+            if (errno == ENOTEMPTY || errno == EEXIST) {
+                return cgi_fail(409, "directory not empty");
+            }
+            if (errno == ENOENT) return cgi_fail(404, "not found");
+            return cgi_fail(500, "cannot remove directory");
+        }
+    } else if (S_ISREG(sb.st_mode)) {
+        if (unlink(path) != 0) {
+            if (errno == ENOENT) return cgi_fail(404, "not found");
+            return cgi_fail(500, "cannot remove file");
+        }
+    } else {
+        return cgi_fail(403, "unsupported file type");
+    }
+
+    json_header();
+    printf("{\"ok\":true,\"name\":");
+    json_string(name);
+    printf("}\n");
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                               */
 /* ------------------------------------------------------------------ */
@@ -361,6 +511,9 @@ int main(void) {
     }
     if (strstr(script, "mkdir.cgi") != NULL) {
         return action_mkdir();
+    }
+    if (strstr(script, "delete.cgi") != NULL) {
+        return action_delete();
     }
     return cgi_fail(404, "unknown management action");
 }
