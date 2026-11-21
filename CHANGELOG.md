@@ -1,5 +1,23 @@
 # Changelog / 变更记录
 
+## v1.0.7 — 2026-11-21 — 设备上改 Web 密码的辅助脚本 / On-device Web password changer
+
+新增 `deploy/change_password.sh`，由 `install.sh` 安装到设备
+`<ROOT_DIR>/bin/change_password.sh`。在设备上运行，用 `openssl passwd -1 -stdin`
+重算托管 `etc/htpasswd` 的 crypt(3) hash；bozohttpd 每请求重读 `.htpasswd`，
+新密码**立即生效**（无需重启/reboot/重装）。交互式双次输入不回显；也可从 stdin
+喂入密码（不进 argv/shell 历史）。保留其他用户、维持 0600、拒绝空密码/不一致。
+README 中英双语已补用法。此改动不改任何二进制，三二进制哈希与 v1.0.6 相同。
+
+Added `deploy/change_password.sh`, installed by `install.sh` to the device at
+`<ROOT_DIR>/bin/change_password.sh`. Run it on the device; it recomputes the
+crypt(3) hash in the managed `etc/htpasswd` via `openssl passwd -1 -stdin`.
+bozohttpd re-reads `.htpasswd` per request, so the new password takes effect
+immediately (no restart/reboot/reinstall). Interactive double-entry hides input;
+a password can also be fed on stdin (never in argv/history). Other users and
+mode 0600 are preserved; empty/mismatched passwords are rejected. README (both
+languages) updated. No binaries changed — hashes identical to v1.0.6.
+
 ## v1.0.6 — 2026-11-21 — 中文上传文件名 + 移动到文件夹 / UTF-8 upload names + move entry
 
 ### 1. 修复：上传中文文件名被 400 拒绝 / Fix: Chinese upload filenames rejected

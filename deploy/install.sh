@@ -67,6 +67,7 @@ guard_path ROOT_DIR "${ROOT_DIR}"
 [ -f "${PKG_ROOT}/deploy/index.html" ] || die "missing management homepage template"
 [ -f "${PKG_ROOT}/deploy/boot_hook.sh" ] || die "missing boot hook source"
 [ -f "${PKG_ROOT}/deploy/common.sh" ] || die "missing common helper source"
+[ -f "${PKG_ROOT}/deploy/change_password.sh" ] || die "missing password-change helper source"
 
 # Decide install vs. update BEFORE the Flash space gate: an update overwrites
 # the same three files in place and does not need room for a second copy.
@@ -224,7 +225,10 @@ chmod 0755 "${HTTPD}" "${UPLOAD_BIN}" "${MANAGE_BIN}"
 
 cp -f "${PKG_ROOT}/deploy/boot_hook.sh" "${BOOT_HOOK}" || die "cannot install boot hook"
 cp -f "${PKG_ROOT}/deploy/common.sh" "${BIN_DIR}/tc_common.sh" || die "cannot install common helpers"
-chmod 0755 "${BOOT_HOOK}"
+# On-device password-change helper (optional convenience; needs openssl+stty).
+cp -f "${PKG_ROOT}/deploy/change_password.sh" "${BIN_DIR}/change_password.sh" \
+    || die "cannot install password-change helper"
+chmod 0755 "${BOOT_HOOK}" "${BIN_DIR}/change_password.sh"
 chmod 0644 "${BIN_DIR}/tc_common.sh"
 
 # Paths file: source this before tc_common.sh.  Values are absolute and

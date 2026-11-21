@@ -89,6 +89,7 @@ The management homepage is a **program file**: its master copy lives in managed 
 │   ├── install.sh / uninstall.sh
 │   ├── boot_hook.sh           starts bozohttpd with verified flags
 │   ├── index.html             management homepage template (program file)
+│   ├── change_password.sh     on-device helper to rotate the Web password
 │   ├── htpasswd.example       placeholder only
 │   └── thttpd.conf            historical, informational only
 ├── docs/device-layout.md      on-device layout and ownership
@@ -267,6 +268,28 @@ and the UI asks for confirmation. There is no trash and no undo — keep backups
 Responses: `200 {"ok":true,...}`, `400` bad name, `403` symlink/special file,
 `404` missing, `409` directory not empty, `500` other errors.
 
+#### Changing the Web password on the device
+
+`deploy/change_password.sh` is installed to `<ROOT_DIR>/bin/change_password.sh`.
+Run it **on the device** (it has `openssl` + `stty`); it regenerates the crypt(3)
+hash in the managed `etc/htpasswd` in place. bozohttpd re-reads `.htpasswd` on
+every request, so the new password is live **immediately** — no restart, no
+reboot, no re-running `install.sh`.
+
+```sh
+# Interactive (prompts twice, hides input):
+ssh root@<device-ip> 'sh /mnt/Flash/.tc_webshare/bin/change_password.sh'
+
+# Or non-interactive: feed the password on stdin (never in argv/shell history):
+printf '%s\n' 'NEW_PASSWORD' | ssh root@<device-ip> \
+  'sh /mnt/Flash/.tc_webshare/bin/change_password.sh'
+# Override the username with -u: ... | sh change_password.sh -u alice
+```
+
+The script preserves other users in `htpasswd`, keeps mode `0600`, rejects
+empty/mismatched passwords, and writes the hash via `openssl passwd -1 -stdin`
+(plaintext is never passed as an argument or stored in a file).
+
 ### 7. Verification checklist
 
 - [ ] `netstat -an | sed -n '/LISTEN/p'` shows 8080 (Samba 139/445/548 normally present)
@@ -392,7 +415,7 @@ GPL-3.0-or-later; see [LICENSE](LICENSE). `build/env.sh` preserves TimeCapsuleSM
 
 ### 4. 文件树
 
-（同英文版，新增 `deploy/common.sh`；`deploy/thttpd.conf` 仅为历史说明文件；`tests/` 为纯本地验证脚本，不参与设备部署；`docs/screenshots/` 存放真机管理界面截图，见该目录 README 与上文界面章节。）
+（同英文版，新增 `deploy/common.sh` 与 `deploy/change_password.sh`——后者安装到设备 `bin/`，用于在设备上修改 Web 密码；`deploy/thttpd.conf` 仅为历史说明文件；`tests/` 为纯本地验证脚本，不参与设备部署；`docs/screenshots/` 存放真机管理界面截图，见该目录 README 与上文界面章节。）
 
 ### 5. 构建（本机/Docker，不碰真机）
 
@@ -460,6 +483,20 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 **v1.0.6 中文上传名**：上传文件名现在与文件夹名使用**同一套严格 UTF-8 校验**，`内网算力统筹与工作思路.docx`、emoji 名字等都能正常上传，不再返回 HTTP 400；畸形 UTF-8、分隔符、`..`、控制字节与超过 200 字节的名字仍拒绝，`.gitignore` 这类隐藏文件名仍可上传（详见英文版对应段落）。
 
 `/move.cgi` **绝不覆盖**：`name == to` 或目标已有同名条目返回 409；软链源/目标或目标不是目录返回 403；非法名返回 400；源或目标不存在返回 404。只允许「顶层 → 一层已有的顶层文件夹」，不递归、不跨层、不会移出 `TC_SHARE_DIR`。
+
+**在设备上修改 Web 密码**：`deploy/change_password.sh` 会安装到 `<ROOT_DIR>/bin/change_password.sh`。**在设备上**运行（设备有 `openssl` + `stty`），它会原地重算托管 `etc/htpasswd` 里的 crypt(3) hash。bozohttpd 每次请求都重读 `.htpasswd`，所以新密码**立即生效**——无需重启、无需 reboot、无需重跑 `install.sh`。
+
+```sh
+# 交互式（提示两次，输入不回显）：
+ssh root@<设备IP> 'sh /mnt/Flash/.tc_webshare/bin/change_password.sh'
+
+# 非交互式：从 stdin 喂入密码（绝不放进 argv / shell 历史）：
+printf '%s\n' '新密码' | ssh root@<设备IP> \
+  'sh /mnt/Flash/.tc_webshare/bin/change_password.sh'
+# 用 -u 改用户名：... | sh change_password.sh -u alice
+```
+
+脚本会保留 `htpasswd` 中的其他用户、维持 `0600` 权限、拒绝空密码/两次不一致，并通过 `openssl passwd -1 -stdin` 生成 hash（明文既不作为参数也不写入文件）。
 
 新建/删除/移动的名称接受**可打印 ASCII 字符（0x20–0x7E，含空格与 `! @ # $ % & ' ( ) + , ; = [ ]` 等常见符号）**以及合法 UTF-8 多字节字符（如 `家庭照片`），最长 **200 字节**；仅拒绝 `/`、`\`、前导点（含 `.`、`..`）、C0/C1/DEL 控制字符与畸形 UTF-8，空格和常见符号是允许的。重名建文件夹返回 409。畸形 UTF-8（overlong、代理区、超出 U+10FFFF）同样拒绝，任何字节序列都无法绕过 basename 检查。`list.cgi` 以 `charset=utf-8` 返回原始 UTF-8 JSON，`JSON.parse` 可直接解析。浏览器 `FormData` 不会发送 `Expect: 100-continue`，因此网页上传不需要 curl 的 `-H 'Expect:'` 补丁。
 
