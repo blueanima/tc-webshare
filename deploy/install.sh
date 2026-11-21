@@ -159,9 +159,19 @@ if [ "${UPDATE_MODE}" -eq 1 ] && [ -f "${PIDFILE}" ]; then
 fi
 
 # --- 2. snapshot non-Web boot.sh lines BEFORE any change ------------------
-TMP_NONWEB=${STATE_DIR}/boot.nonweb.new.$$
-TMP_BLOCK=${STATE_DIR}/boot.block.$$
-TMP_BOOT=${STATE_DIR}/boot.new.$$
+# Scratch files go to the RAM tmpfs, NOT the synchronous Flash: the shell
+# writes these line-by-line and every write() on Flash triggers an fsync,
+# which makes a 119-line boot.sh take minutes.  /mnt/Memory is 16 MB tmpfs
+# and resets at boot, which is fine for throwaway scratch.
+TMP_SCRATCH=/mnt/Memory/.tc_webshare_scratch
+if [ -d /mnt/Memory ]; then
+    mkdir -p "${TMP_SCRATCH}" 2>/dev/null || TMP_SCRATCH=${STATE_DIR}
+else
+    TMP_SCRATCH=${STATE_DIR}
+fi
+TMP_NONWEB=${TMP_SCRATCH}/boot.nonweb.new.$$
+TMP_BLOCK=${TMP_SCRATCH}/boot.block.$$
+TMP_BOOT=${TMP_SCRATCH}/boot.new.$$
 mkdir -p "${STATE_DIR}"
 
 nonweb_file "${BOOT_SH}" "${TMP_NONWEB}"

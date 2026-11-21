@@ -69,7 +69,14 @@ if [ ! -d "${WEB_ROOT}" ] && [ "${HAS_MARK}" -eq 0 ]; then
 fi
 
 # --- 1. snapshot current non-Web lines and stop our service ---------------
-TMP_NONWEB=${STATE_DIR}/boot.nonweb.uninstall.$$
+# Scratch on RAM tmpfs, not synchronous Flash (line-by-line writes fsync).
+TMP_SCRATCH=/mnt/Memory/.tc_webshare_scratch
+if [ -d /mnt/Memory ]; then
+    mkdir -p "${TMP_SCRATCH}" 2>/dev/null || TMP_SCRATCH=${STATE_DIR}
+else
+    TMP_SCRATCH=${STATE_DIR}
+fi
+TMP_NONWEB=${TMP_SCRATCH}/boot.nonweb.uninstall.$$
 mkdir -p "${STATE_DIR}"
 nonweb_file "${BOOT_SH}" "${TMP_NONWEB}"
 
@@ -117,7 +124,7 @@ if [ "${HAS_MARK}" -eq 1 ]; then
     count=$(marker_count "${BOOT_SH}")
     [ "${count}" -eq 2 ] || die "boot.sh must contain exactly two marker lines (got ${count}); refusing to edit"
 
-    TMP_BOOT=${STATE_DIR}/boot.uninstall.$$
+    TMP_BOOT=${TMP_SCRATCH}/boot.uninstall.$$
     nonweb_file "${BOOT_SH}" "${TMP_BOOT}"
     chmod u+w "${BOOT_SH}" || die "chmod u+w ${BOOT_SH} failed"
     cp "${TMP_BOOT}" "${BOOT_SH}" || die "failed to restore boot.sh"
