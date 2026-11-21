@@ -35,7 +35,7 @@ ETC_DIR=${WEB_ROOT}/etc
 STATE_DIR=${WEB_ROOT}/state
 BOOT_SH=${TC_BOOT_SH:-/mnt/Flash/boot.sh}
 
-BIN_SRC=${TC_BIN_SRC:-${PKG_ROOT}/build_out/bin}
+BIN_SRC=${TC_BIN_SRC:-${PKG_ROOT}/build_out/stage/bin}
 EXAMPLE_SRC=${TC_EXAMPLE_SRC:-${PKG_ROOT}/deploy/htpasswd.example}
 
 PIDFILE=${STATE_DIR}/bozohttpd.pid
@@ -70,16 +70,19 @@ if [ -d /mnt/Flash ]; then
     fi
 fi
 
+# Actively ask Apple's diskd to mount the internal disk (never format it).
+DATA_VOLUME_OVERRIDE=$(mount_data_volume 2>/dev/null || true)
+if [ -n "${DATA_VOLUME_OVERRIDE}" ]; then
+    say "data volume:  ${DATA_VOLUME_OVERRIDE} (mounted, persistent)"
+else
+    warn "could not mount ${DATA_VOLUMES}; data dir will be volatile tmpfs"
+fi
+
 SHARE_DIR=$(resolve_share_dir)
 guard_path SHARE_DIR "${SHARE_DIR}"
 [ "${SHARE_DIR}" != "${WEB_ROOT}" ] || die "SHARE_DIR must differ from WEB_ROOT"
 say "managed root: ${WEB_ROOT}"
 say "data dir:     ${SHARE_DIR}"
-if detect_data_root >/dev/null 2>&1; then
-    say "data volume:  $(detect_data_root) (mounted disk)"
-else
-    warn "no /Volumes/dkN is mounted; data goes to small Flash fallback ${SHARE_DIR}"
-fi
 
 # Credentials: the device has neither htpasswd nor openssl.  Require a
 # pre-computed crypt(3) hash; never generate or read a plaintext password.

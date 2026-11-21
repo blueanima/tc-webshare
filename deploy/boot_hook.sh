@@ -48,8 +48,10 @@ fi
 [ -x "${UPLOAD_SHIM}" ] || exit 1
 mkdir -p "${STATE_DIR}" || exit 1
 
-# The SATA volume is mounted on demand and may have unmounted since install.
-# Re-resolve the data root and refresh the single docroot auth link.
+# After a reboot the SATA disk is unmounted.  Ask Apple's diskd to mount it
+# again (typed "path:s:" argument), then re-resolve the data root.  The whole
+# thing is best-effort so a failed mount cannot break the Samba boot chain.
+DATA_VOLUME_OVERRIDE=$(mount_data_volume 2>/dev/null || true)
 SHARE_DIR_NOW=$(resolve_share_dir)
 mkdir -p "${SHARE_DIR_NOW}" 2>/dev/null || true
 if [ -f "${HTPASSWD}" ]; then

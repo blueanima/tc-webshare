@@ -50,10 +50,15 @@ build adaptation**, not a feature release.
   covers GET / and POST /upload.cgi. The boot block goes **before**
   `echo 'boot: starting native manager'` and is `{ ...; } || true` wrapped so
   Samba still starts under boot.sh's `set -eu`. Every script sets
-  `PATH=/bin:/sbin:/usr/bin:/usr/sbin`. Data fallback is `<ROOT_DIR>/data` on
-  Flash (no forced mount; disk is Apple-mounted on demand). Uninstall
-  preserves that data unless `--purge-data`. Samba is in fact running; its
-  absence is only a warning. TimeCapsuleSMB is never modified.
+  `PATH=/bin:/sbin:/usr/bin:/usr/sbin`. lead then verified the on-device
+  mount call `/usr/bin/acp rpc diskd.useVolume "path:s:/Volumes/dk2"`; both
+  install and the boot hook now actively mount the internal disk and use
+  `/Volumes/dk2/share/web` (dk3 fallback), so uploads survive reboot. No
+  formatting or partition operation is performed. Only a genuine mount
+  failure falls back to volatile `/mnt/Memory/.tc_webshare/share` with a loud
+  warning. `BIN_SRC` default corrected to `build_out/stage/bin`. Uninstall
+  preserves data unless `--purge-data`. Samba is in fact running; its absence
+  is only a warning. TimeCapsuleSMB is never modified.
 - Scripts avoid grep/awk/head/find/tr/cut/base64/sha256sum/mktemp/stat/mount
   etc.; a new `deploy/common.sh` provides shell-only helpers, and boot.sh
   verification uses a line-exact `state/boot.nonweb` snapshot.

@@ -103,43 +103,74 @@ df_fs() {
     printf '%s\n' "$1"
 }
 
-# Print the first /Volumes/dkN that is really mounted (different filesystem
-# from /Volumes itself) and writable.  Uses ls only (no find).  dkN numbering
-# changes at every boot, so the number must NEVER be baked into a script.
-detect_data_root() {
+ACP_BIN=${ACP_BIN:-/usr/bin/acp}
+# dkN numbering CAN change, so try several candidates; dk2 is the internal
+# disk on this unit (verified by lead via `acp -q MaSt`).  No partition or
+# format operation is ever performed - we only ask Apple's diskd to mount a
+# volume that already exists, exactly as TimeCapsuleSMB does.
+DATA_VOLUMES=${DATA_VOLUMES:-"/Volumes/dk2 /Volumes/dk3"}
+MOUNT_RETRIES=${MOUNT_RETRIES:-15}
+
+# True when VOL is a mounted, writable filesystem (not the root of /Volumes).
+data_volume_ready() {
+    ready_vol=$1
+    [ -d "${ready_vol}" ] || return 1
+    [ -w "${ready_vol}" ] || return 1
     base_fs=$(df_fs /Volumes 2>/dev/null || true)
-    [ -n "${base_fs}" ] || return 1
-    listing=$(ls /Volumes 2>/dev/null || true)
-    for name in ${listing}; do
-        case "${name}" in
-            dk[0-9]*) ;;
-            *) continue ;;
-        esac
-        vol="/Volumes/${name}"
-        [ -d "${vol}" ] || continue
-        [ -w "${vol}" ] || continue
-        vol_fs=$(df_fs "${vol}" 2>/dev/null || true)
-        [ -n "${vol_fs}" ] || continue
-        [ "${vol_fs}" != "${base_fs}" ] || continue
-        printf '%s\n' "${vol}"
-        return 0
+    vol_fs=$(df_fs "${ready_vol}" 2>/dev/null || true)
+    [ -n "${base_fs}" ] && [ -n "${vol_fs}" ] && [ "${vol_fs}" != "${base_fs}" ]
+}
+
+# Actively mount (if needed) and print the usable data volume.  The typed
+# parameter "path:s:<path>" is REQUIRED by acp rpc diskd.useVolume; a bare
+# path fails with -6742 (lead verified on-device).
+mount_data_volume() {
+    if [ -n "${DATA_VOLUME_OVERRIDE:-}" ]; then
+        if data_volume_ready "${DATA_VOLUME_OVERRIDE}"; then
+            printf '%s\n' "${DATA_VOLUME_OVERRIDE}"
+            return 0
+        fi
+        return 1
+    fi
+    for candidate in ${DATA_VOLUMES}; do
+        if data_volume_ready "${candidate}"; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+        if [ -x "${ACP_BIN}" ]; then
+            "${ACP_BIN}" rpc diskd.useVolume "path:s:${candidate}" >/dev/null 2>&1 || true
+            retry=0
+            while [ "${retry}" -lt "${MOUNT_RETRIES}" ]; do
+                if data_volume_ready "${candidate}"; then
+                    printf '%s\n' "${candidate}"
+                    return 0
+                fi
+                retry=$((retry + 1))
+                sleep 1
+            done
+        fi
     done
     return 1
 }
 
-# User-data root.  Explicit TC_SHARE_DIR always wins; otherwise a currently
-# mounted disk is used (Apple mounts it on demand and unmounts on idle, so we
-# never trigger a mount ourselves).  Fallback is a small data directory on
-# Flash; README documents the capacity limit.  Binaries never live on dkN.
+# Backward-compatible alias used by earlier install reports.
+detect_data_root() { mount_data_volume; }
+
+# User-data root.  Explicit TC_SHARE_DIR wins; otherwise actively mount the
+# internal disk and use its share/web subdir.  If mounting genuinely fails we
+# fall back to tmpfs (VOLATILE - loud warning), because the user's hard
+# requirement is persistence and a silent fallback to Flash would be small
+# and misleading.  Binaries are never stored on dkN.
 resolve_share_dir() {
     if [ -n "${TC_SHARE_DIR:-}" ]; then
         printf '%s\n' "${TC_SHARE_DIR}"
         return 0
     fi
-    if vol=$(detect_data_root); then
+    if vol=$(mount_data_volume); then
         printf '%s\n' "${vol}/share/web"
     else
-        printf '%s\n' "${ROOT_DIR}/data"
+        warn "disk mount failed; data falls back to VOLATILE tmpfs /mnt/Memory/.tc_webshare/share (uploads will NOT survive reboot)"
+        printf '%s\n' "/mnt/Memory/.tc_webshare/share"
     fi
 }
 

@@ -55,7 +55,7 @@ bozohttpd **rebuilds the CGI environment from scratch** and drops custom variabl
 ### 3. Deployment path strategy
 
 - `ROOT_DIR` (binaries, config, state, manifest) defaults to **`/mnt/Flash/.tc_webshare`** — persistent and executable. Flash is only 2.7 MB; `install.sh` aborts if `df -k /mnt/Flash` reports under 1024 KiB free. Override with `TC_ROOT_DIR`.
-- `SHARE_DIR` (user data) is resolved **at install and again at every boot** by `detect_data_root()`: first explicit `TC_SHARE_DIR`; else the first writable `/Volumes/dkN` whose filesystem differs from `/Volumes` (via `ls` + `df`); else `<ROOT_DIR>/data` on Flash. **No dkN number is ever hardcoded**, and we never force a mount: Apple mounts the disk only when a client touches the share. The Flash fallback is small (the two binaries already use ~844 KiB); keep uploads small while the disk is unmounted.
+- `SHARE_DIR` (user data) is resolved **at install and again at every boot** by `mount_data_volume()` / `detect_data_root()`: explicit `TC_SHARE_DIR` wins; otherwise we **actively ask Apple's diskd to mount** the internal disk with `/usr/bin/acp rpc diskd.useVolume "path:s:/Volumes/dk2"` (the typed `path:s:` prefix is mandatory; bare paths fail with `-6742`), poll `df -k` until it appears, and use `/Volumes/dk2/share/web`. dk3 is tried as a second candidate so a changed dkN is tolerated. **No formatting or partition changes are ever performed** — this only mounts a volume Apple already manages. If mounting genuinely fails we fall back to `/mnt/Memory/.tc_webshare/share` with a loud warning: that tmpfs is **volatile**, so persistence is lost until the disk mounts again. dk2 was confirmed on-device with ~1.8 TB free.
 - Binaries never go on the disk (it unmounts on idle and cannot execute ELF); only data does.
 - boot.sh has `set -eu` and ends with `echo 'boot: starting native manager'` + `exec /mnt/Flash/service manager`. The marker block is inserted **before the echo** and wrapped in `{ ...; } || true`, so our hook cannot stop Samba. Appending after `exec` would never run. chmod u+w/u-w brackets the write.
 - Uninstall removes only the two marker lines and their contents and compares the rest of boot.sh line-for-line against `state/boot.nonweb` (`sha256sum` is absent; `openssl dgst` is available if a hash is ever needed). If data lives inside the managed root, uninstall preserves it unless `--purge-data` is given.
@@ -143,8 +143,8 @@ Copy package and artifacts (sshd has no SFTP, use `-O`):
 
 ```sh
 scp -O -r tc-webshare root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg
-scp -O build_out/bin/httpd build_out/bin/upload.cgi \
-    root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg/build_out/bin/
+scp -O build_out/stage/bin/httpd build_out/stage/bin/upload.cgi \
+    root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg/build_out/stage/bin/
 ```
 
 Generate the crypt(3) hash on the build machine (e.g. `openssl passwd -1`) and deploy; the device has no `htpasswd`, so plaintext passwords are deliberately unsupported:
@@ -173,7 +173,7 @@ curl -u admin:'<password>' -F 'file=@/path/to/test.txt' \
 - [ ] duplicate filenames get `.1` suffixes; bad filenames get 400
 - [ ] `boot.sh` contains exactly one marker block, before the `starting native manager` echo, `|| true` wrapped; Samba still starts
 - [ ] `state/boot.nonweb` matches the non-marker lines of boot.sh
-- [ ] after the disk unmounts, the boot hook still starts using the Flash `data/` fallback
+- [ ] after reboot the boot hook re-mounts the disk via acp and serves from `/Volumes/dk2/share/web`; if acp fails, a loud tmpfs warning is printed
 - [ ] TimeCapsuleSMB files are untouched; no tcn marker lines remain after uninstall
 
 ### 8. Rollback
@@ -236,7 +236,7 @@ bozohttpd 会**重建 CGI 环境**，自定义变量全部丢失，所以 `uploa
 ### 3. 部署路径策略
 
 - `ROOT_DIR`（二进制/配置/状态）默认 **`/mnt/Flash/.tc_webshare`**，持久且可执行。Flash 只有 2.7MB，安装前用 `df -k` 检查，低于 1024 KiB 直接失败。
-- `SHARE_DIR`（用户数据）由 `detect_data_root()` 在安装与每次开机时**动态解析**：显式 `TC_SHARE_DIR` > 第一个已挂载且可写的 `/Volumes/dkN`（`ls` + `df` 判定）> `<ROOT_DIR>/data`（Flash）。**绝不硬编码 dkN 编号，也不主动触发挂载**（Apple 只在客户端访问共享时挂盘）。Flash 回退空间很小，硬盘未挂载时请控制上传体积。
+- `SHARE_DIR`（用户数据）在安装与每次开机时由 `mount_data_volume()` **主动挂载**：显式 `TC_SHARE_DIR` 优先；否则执行 `/usr/bin/acp rpc diskd.useVolume "path:s:/Volumes/dk2"`（`path:s:` 类型前缀必须带，裸路径会报 `-6742`），轮询 `df -k` 确认后使用 `/Volumes/dk2/share/web`；再尝试 dk3 以容忍编号变化。**只挂载、绝不格式化或改分区**。挂载失败才回退 `/mnt/Memory/.tc_webshare/share`（tmpfs，易失，明确告警）；dk2 真机已确认约 1.8TB 可用。
 - 二进制不放硬盘（会卸载且不能执行），硬盘只放数据。
 - boot.sh 带 `set -eu`，结尾是 `echo 'boot: starting native manager'` + `exec /mnt/Flash/service manager`。标记块插在 **echo 之前**并用 `{ ...; } || true` 包裹，避免我们的 hook 非零导致 Samba 起不来；写前 `chmod u+w`、写后 `u-w`。
 - 卸载只删标记块，并逐行比对 boot.sh 其余内容与 `state/boot.nonweb`（设备无 `sha256sum`，必要时可用 `openssl dgst`）。数据若位于管理根目录内，默认卸载也会保留，除非 `--purge-data`。
@@ -276,8 +276,8 @@ SRC_ROOT=/wb-build/src BUILD_OUT=/path/to/stage ./run.sh
 ```sh
 # sshd 无 SFTP，必须 -O
 scp -O -r tc-webshare root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg
-scp -O build_out/bin/httpd build_out/bin/upload.cgi \
-    root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg/build_out/bin/
+scp -O build_out/stage/bin/httpd build_out/stage/bin/upload.cgi \
+    root@<TC-LAN-IP>:/mnt/Flash/.tc_webshare_pkg/build_out/stage/bin/
 
 # 设备无 htpasswd，必须先在本地（openssl passwd -1）生成 crypt(3) hash
 TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
@@ -287,4 +287,4 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 
 ### 7. 验证清单 / 8. 回退 / 9. 安全 / 10. 许可
 
-见英文版对应章节：重点确认 8080 LISTEN、401 认证、`/upload.cgi` 上传落点、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、硬盘卸载后 Flash `data/` 回退仍可用、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；GPL-3.0-or-later。
+见英文版对应章节：重点确认 8080 LISTEN、401 认证、`/upload.cgi` 上传落点、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、开机后 boot hook 通过 acp 重新挂载硬盘并继续使用 `/Volumes/dk2/share/web`（失败时明确告警并回退易失 tmpfs）、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；GPL-3.0-or-later。
