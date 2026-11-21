@@ -247,9 +247,11 @@ chmod 0644 "${BIN_DIR}/tc_common.sh"
 chmod 0644 "${BIN_DIR}/tc_paths.sh"
 
 # bozohttpd's "-C .cgi" maps every .cgi URL to ONE handler.  This generated
-# shell dispatcher restores TC_SHARE_DIR / TC_STATE_DIR (bozohttpd rebuilds
-# the CGI environment) and routes by SCRIPT_NAME to Flash-resident static
-# binaries.  No program file is ever executed from the unmountable disk.
+# shell dispatcher restores TC_SHARE_DIR / TC_STATE_DIR / TC_ETC_DIR (bozohttpd
+# rebuilds the CGI environment) and routes by SCRIPT_NAME to Flash-resident
+# static binaries.  No program file is ever executed from the unmountable disk.
+# TC_ETC_DIR is baked here so /chpasswd.cgi never has to guess the credential
+# path; manage.c still understands older dispatchers that only export STATE_DIR.
 {
     printf '%s\n' '#!/bin/sh'
     printf '%s\n' '# tc-webshare generated CGI dispatcher (bozohttpd clears the environment).'
@@ -257,10 +259,11 @@ chmod 0644 "${BIN_DIR}/tc_paths.sh"
     printf ". '%s'\n" "${BIN_DIR}/tc_common.sh"
     printf "TC_SHARE_DIR=\$(resolve_share_dir)\n"
     printf "TC_STATE_DIR='%s'\n" "${STATE_DIR}"
-    printf 'export TC_SHARE_DIR TC_STATE_DIR\n'
+    printf "TC_ETC_DIR='%s'\n" "${ETC_DIR}"
+    printf 'export TC_SHARE_DIR TC_STATE_DIR TC_ETC_DIR\n'
     printf '%s\n' 'case "${SCRIPT_NAME:-}" in'
     printf '  */upload.cgi) exec "%s" ;;\n' "${UPLOAD_BIN}"
-    printf '  */list.cgi|*/mkdir.cgi|*/delete.cgi|*/move.cgi) exec "%s" ;;\n' "${MANAGE_BIN}"
+    printf '  */list.cgi|*/mkdir.cgi|*/delete.cgi|*/move.cgi|*/chpasswd.cgi) exec "%s" ;;\n' "${MANAGE_BIN}"
     printf '%s\n' '  *) printf "Status: 404 Not Found\r\nContent-Type: text/plain\r\n\r\nunknown CGI\r\n"; exit 0 ;;'
     printf '%s\n' 'esac'
 } > "${CGI_SHIM}"
@@ -366,7 +369,7 @@ say "installed: ${WEB_ROOT}"
 say "data dir:  ${SHARE_DIR}"
 say "manifest:  ${MANIFEST}"
 say "server:    ${HTTPD} (bozohttpd)"
-say "CGI shim:  ${CGI_SHIM} -> /upload.cgi, /list.cgi, /mkdir.cgi, /delete.cgi, /move.cgi (-C .cgi)"
+say "CGI shim:  ${CGI_SHIM} -> /upload.cgi, /list.cgi, /mkdir.cgi, /delete.cgi, /move.cgi, /chpasswd.cgi (-C .cgi)"
 say "homepage:  ${SHARE_DIR}/${INDEX_FILE_NAME}"
 say "ports:     8080=LISTEN (Samba untouched)"
 if [ "${UPDATE_MODE}" -eq 1 ]; then

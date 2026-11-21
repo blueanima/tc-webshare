@@ -10,6 +10,19 @@
  *                  TC_SHARE_DIR (name from the same sources as mkdir)
  *   /move.cgi   -> move ONE top-level file or directory into an existing
  *                  top-level directory (name + to from form/query)
+ *   /chpasswd.cgi -> replace the admin (or current Basic-auth user) entry in
+ *                  the managed <ROOT>/etc/htpasswd with a fresh crypt(3)
+ *                  "$1$" hash (POST form field new_password; optional
+ *                  old_password is verified against the existing hash)
+ *
+ * v1.0.8 password handling: the hash is computed in THIS process with
+ * crypt() from libcrypt (statically linked, like bozohttpd itself), so the
+ * plaintext never reaches argv, a shell, a pipe or a child process.  The
+ * password is wiped from our stack buffers before the CGI returns.  The
+ * target file path is fixed relative to an install-time-baked TC_ETC_DIR
+ * (or, for older dispatchers, derived from TC_STATE_DIR); no client input
+ * can influence it.  Writes are atomic (same-directory temp + rename) and
+ * keep mode 0600 and all other htpasswd users.
  *
  * Security rules (same strength as upload.c):
  *   - names may use ASCII [A-Za-z0-9._-] plus well-formed UTF-8 multibyte
@@ -47,10 +60,16 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
+/* NetBSD declares crypt() under _XOPEN_SOURCE (or _NETBSD_SOURCE).  Defining
+ * _POSIX_C_SOURCE alone hides it and -Wall reports an implicit declaration. */
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
 
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -70,6 +89,10 @@
 #define MAX_BODY 4096
 #define MAX_ENTRIES 5000
 #define DEFAULT_SHARE_DIR "/Volumes/dk2/share/web"
+#define MAX_PASS 200           /* password bytes, not characters */
+#define MAX_USER 64            /* htpasswd username bytes */
+#define MAX_HASH 256           /* enough for $1$ / $2a$ / $6$ hashes */
+#define MAX_HTPASSWD 16384     /* cap on a htpasswd file we will rewrite */
 
 typedef struct {
     char name[MAX_NAME + 1];
@@ -597,6 +620,491 @@ static int action_move(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* v1.0.8: Web password change                                        */
+/* ------------------------------------------------------------------ */
+
+/* True when KEY appears as a complete name in a urlencoded body.  form_value()
+ * uses -1 for both "absent" and "malformed"; this lets callers tell an
+ * intentionally omitted optional field from a broken one. */
+static int form_has_key(const char *buf, const char *key) {
+    size_t key_len = strlen(key);
+    const char *p = buf;
+    size_t remaining = strlen(buf);
+
+    while (remaining > 0) {
+        const char *amp = memchr(p, '&', remaining);
+        size_t part_len = (amp != NULL) ? (size_t)(amp - p) : remaining;
+        const char *eq = memchr(p, '=', part_len);
+        size_t name_len = (eq != NULL) ? (size_t)(eq - p) : part_len;
+
+        if (name_len == key_len && memcmp(p, key, key_len) == 0) return 1;
+        if (amp == NULL) break;
+        p = amp + 1;
+        remaining -= part_len + 1;
+    }
+    return 0;
+}
+
+/* Passwords may be UTF-8 (the on-device helper accepts any text line), but
+ * NUL, C0/C1 controls and DEL are refused.  valid_utf8_bytes() already
+ * enforces exactly those rules plus RFC 3629 well-formedness. */
+static int valid_password(const char *password) {
+    size_t n = 0;
+
+    if (password == NULL || password[0] == '\0') return 0;
+    n = strlen(password);
+    if (n > MAX_PASS) return 0;
+    return valid_utf8_bytes(password, n);
+}
+
+/* htpasswd usernames are a deliberately small, colon-free subset. */
+static int valid_user_bytes(const char *user, size_t n) {
+    size_t i = 0;
+
+    if (user == NULL || n == 0 || n > MAX_USER) return 0;
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)user[i];
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+static int valid_user_name(const char *user) {
+    return (user != NULL) ? valid_user_bytes(user, strlen(user)) : 0;
+}
+
+/* Only a plain absolute path with no "." / ".." / empty components is
+ * accepted.  All values come from install-time-baked env vars, never from
+ * the browser, but refusing odd paths keeps the write target predictable. */
+static int safe_path(const char *path) {
+    const char *p = NULL;
+
+    if (path == NULL || path[0] != '/' || path[0] == '\0') return 0;
+    if (strlen(path) + 1 > PATH_MAX) return 0;
+    p = path + 1;
+    while (*p != '\0') {
+        const char *slash = strchr(p, '/');
+        size_t len = (slash != NULL) ? (size_t)(slash - p) : strlen(p);
+        if (len == 0) return 0;                     /* "//" */
+        if (len == 1 && p[0] == '.') return 0;
+        if (len == 2 && p[0] == '.' && p[1] == '.') return 0;
+        if (slash == NULL) break;
+        p = slash + 1;
+    }
+    return 1;
+}
+
+/*
+ * Resolve the managed ETC_DIR.  New dispatchers export TC_ETC_DIR directly
+ * (baked by install.sh); dispatchers from v1.0.7 and earlier only export
+ * TC_STATE_DIR, so derive <ROOT>/etc = dirname(TC_STATE_DIR)/etc as a
+ * compatibility fallback.  Both inputs are install-controlled constants.
+ */
+static int resolve_etc_dir(char *dst, size_t dst_size) {
+    const char *etc = getenv("TC_ETC_DIR");
+    const char *state = NULL;
+    char state_copy[PATH_MAX];
+    char *slash = NULL;
+    size_t n = 0;
+
+    if (etc != NULL && etc[0] != '\0') {
+        n = (size_t)snprintf(dst, dst_size, "%s", etc);
+    } else {
+        state = getenv("TC_STATE_DIR");
+        if (state == NULL || state[0] == '\0') return 0;
+        (void)snprintf(state_copy, sizeof(state_copy), "%s", state);
+        slash = strrchr(state_copy, '/');
+        if (slash == NULL || slash == state_copy || slash[1] == '\0') return 0;
+        *slash = '\0';
+        if (!safe_path(state_copy)) return 0;
+        n = (size_t)snprintf(dst, dst_size, "%s/etc", state_copy);
+    }
+    if (n == 0 || n >= dst_size) return 0;
+    return safe_path(dst);
+}
+
+/* Length of the username before the first ':' in one htpasswd line. */
+static size_t htpasswd_user_len(const char *line, size_t line_len) {
+    size_t i = 0;
+
+    for (i = 0; i < line_len; i++) {
+        if (line[i] == ':') return i;
+    }
+    return 0;
+}
+
+/* Copy the hash field of USER into HASH.  Returns 1 when found. */
+static int htpasswd_find_user(const char *buf, size_t buf_len,
+                              const char *user, char *hash, size_t hash_size) {
+    const char *p = buf;
+    size_t remaining = buf_len;
+
+    hash[0] = '\0';
+    while (remaining > 0) {
+        const char *nl = memchr(p, '\n', remaining);
+        size_t line_len = (nl != NULL) ? (size_t)(nl - p) : remaining;
+        size_t user_len = htpasswd_user_len(p, line_len);
+        size_t hash_len = 0;
+
+        if (user_len > 0 && user_len == strlen(user) &&
+            memcmp(p, user, user_len) == 0) {
+            hash_len = line_len - user_len - 1;
+            if (hash_len > 0 && p[line_len - 1] == '\r') hash_len--;
+            if (hash_len >= hash_size) return 0;
+            memcpy(hash, p + user_len + 1, hash_len);
+            hash[hash_len] = '\0';
+            return 1;
+        }
+        if (nl == NULL) break;
+        p = nl + 1;
+        remaining -= line_len + 1;
+    }
+    return 0;
+}
+
+/* Count user lines; when exactly one exists, copy its name into FIRST. */
+static int htpasswd_user_count(const char *buf, size_t buf_len,
+                               char *first, size_t first_size) {
+    const char *p = buf;
+    size_t remaining = buf_len;
+    int count = 0;
+
+    first[0] = '\0';
+    while (remaining > 0) {
+        const char *nl = memchr(p, '\n', remaining);
+        size_t line_len = (nl != NULL) ? (size_t)(nl - p) : remaining;
+        size_t user_len = htpasswd_user_len(p, line_len);
+
+        if (user_len > 0 && valid_user_bytes(p, user_len)) {
+            count++;
+            if (count == 1) {
+                size_t n = (user_len >= first_size) ? first_size - 1 : user_len;
+                memcpy(first, p, n);
+                first[n] = '\0';
+            }
+            if (count > 1) break;
+        }
+        if (nl == NULL) break;
+        p = nl + 1;
+        remaining -= line_len + 1;
+    }
+    return count;
+}
+
+/*
+ * Pick the entry to rotate.  bozohttpd may expose the authenticated name as
+ * REMOTE_USER: if it names an existing user we rotate exactly that account
+ * (important for installs made with TC_WEB_USER != admin).  Otherwise prefer
+ * "admin" when present, then the sole existing user, then "admin" as a new
+ * entry.  Remaining users are always preserved.
+ */
+static void choose_target_user(const char *buf, size_t buf_len,
+                               char *user, size_t user_size) {
+    const char *remote = getenv("REMOTE_USER");
+    char hash[MAX_HASH];
+    char first[MAX_USER + 1];
+    int count = 0;
+
+    if (remote != NULL && valid_user_name(remote) &&
+        htpasswd_find_user(buf, buf_len, remote, hash, sizeof(hash))) {
+        (void)snprintf(user, user_size, "%s", remote);
+        return;
+    }
+    if (htpasswd_find_user(buf, buf_len, "admin", hash, sizeof(hash))) {
+        (void)snprintf(user, user_size, "admin");
+        return;
+    }
+    count = htpasswd_user_count(buf, buf_len, first, sizeof(first));
+    if (count == 1 && first[0] != '\0') {
+        (void)snprintf(user, user_size, "%s", first);
+        return;
+    }
+    (void)snprintf(user, user_size, "admin");
+}
+
+/* 8-character MD5-crypt salt from [./0-9A-Za-z], never a secret. */
+static void make_salt(char salt[9]) {
+    static const char alphabet[] =
+        "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    static unsigned int counter = 0;
+    unsigned char bytes[8];
+    ssize_t got = 0;
+    int fd = -1;
+    unsigned int mix = 0;
+    size_t i = 0;
+
+    fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        while (got < (ssize_t)sizeof(bytes)) {
+            ssize_t n = read(fd, bytes + got, sizeof(bytes) - (size_t)got);
+            if (n > 0) {
+                got += n;
+            } else if (n < 0 && errno == EINTR) {
+                continue;
+            } else {
+                break;
+            }
+        }
+        (void)close(fd);
+    }
+    if (got != (ssize_t)sizeof(bytes)) {
+        /* Fallback: uniqueness only.  A salt is not a secret. */
+        counter++;
+        mix = (unsigned int)getpid() ^ (unsigned int)time(NULL) ^
+              (unsigned int)(uintptr_t)&counter ^ (counter * 2654435761u);
+        for (i = 0; i < sizeof(bytes); i++) {
+            mix = mix * 1103515245u + 12345u;
+            bytes[i] = (unsigned char)(mix >> 16);
+        }
+    }
+    for (i = 0; i < sizeof(bytes); i++) {
+        salt[i] = alphabet[bytes[i] & 0x3f];
+    }
+    salt[8] = '\0';
+}
+
+/* Copy all htpasswd lines except USER, then append USER:HASH. */
+static int build_htpasswd(const char *src, size_t src_len,
+                          const char *user, const char *hash,
+                          char *out, size_t out_size) {
+    const char *p = src;
+    size_t remaining = src_len;
+    size_t used = 0;
+    size_t need = 0;
+    size_t user_len = strlen(user);
+
+    while (remaining > 0) {
+        const char *nl = memchr(p, '\n', remaining);
+        size_t line_len = (nl != NULL) ? (size_t)(nl - p) : remaining;
+        size_t name_len = htpasswd_user_len(p, line_len);
+        int skip = (name_len == user_len && memcmp(p, user, user_len) == 0);
+        size_t extra = 0;
+
+        if (!skip) {
+            extra = (nl != NULL) ? 1 : 0;            /* preserve newline */
+            need = line_len + extra;
+            if (need > out_size - used - 1) return 0;
+            memcpy(out + used, p, line_len);
+            used += line_len;
+            if (extra != 0) out[used++] = '\n';
+        }
+        if (nl == NULL) break;
+        p = nl + 1;
+        remaining -= line_len + 1;
+    }
+
+    need = user_len + 1 + strlen(hash) + 1;         /* user:hash\n */
+    if (need > out_size - used - 1) return 0;
+    memcpy(out + used, user, user_len);
+    used += user_len;
+    out[used++] = ':';
+    (void)memcpy(out + used, hash, strlen(hash));
+    used += strlen(hash);
+    out[used++] = '\n';
+    out[used] = '\0';
+    return 1;
+}
+
+/* Same-directory temp file + rename(): readers see either the old or the new
+ * complete file, never a half-written one.  The docroot .htpasswd symlink
+ * points at this path, so no restart or link update is needed. */
+static int write_htpasswd_atomic(const char *etc_dir,
+                                 const char *content, size_t content_len) {
+    char final_path[PATH_MAX];
+    char tmp_path[PATH_MAX];
+    struct stat sb;
+    int fd = -1;
+    int rc = -1;
+    int attempt = 0;
+    size_t written = 0;
+
+    (void)snprintf(final_path, sizeof(final_path), "%s/htpasswd", etc_dir);
+    if (!safe_path(final_path)) return -1;
+    if (lstat(final_path, &sb) == 0) {
+        if (!S_ISREG(sb.st_mode)) return -1;        /* refuse symlink/special */
+    } else if (errno != ENOENT) {
+        return -1;
+    }
+
+    for (attempt = 0; attempt < 100; attempt++) {
+        (void)snprintf(tmp_path, sizeof(tmp_path), "%s/.htpasswd.tmp.%ld.%d",
+                       etc_dir, (long)getpid(), attempt);
+#ifdef O_NOFOLLOW
+        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+#else
+        /* O_EXCL alone already refuses a pre-existing symlink; O_NOFOLLOW
+         * on NetBSD is defence in depth against a race. */
+        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+#endif
+        if (fd >= 0) break;
+        if (errno != EEXIST) return -1;
+    }
+    if (fd < 0) return -1;
+
+    while (written < content_len) {
+        ssize_t n = write(fd, content + written, content_len - written);
+        if (n > 0) {
+            written += (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            goto cleanup;
+        }
+    }
+    if (fchmod(fd, 0600) != 0) goto cleanup;
+    /* The device's mfs/Flash is synchronous; a failed fsync is not a reason
+     * to discard an otherwise complete rename. */
+    (void)fsync(fd);
+    if (close(fd) != 0) {
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    if (rename(tmp_path, final_path) != 0) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (fd >= 0) (void)close(fd);
+    if (rc != 0) (void)unlink(tmp_path);
+    return rc;
+}
+
+static int chpasswd_commit(const char *password,
+                           const char *old_password, int has_old) {
+    char etc_dir[PATH_MAX];
+    char content[MAX_HTPASSWD + 1];
+    char rebuilt[MAX_HTPASSWD + MAX_HASH + MAX_USER + 16];
+    char user[MAX_USER + 1];
+    char existing_hash[MAX_HASH];
+    char salt[9];
+    char setting[16];
+    char *encoded = NULL;
+    size_t content_len = 0;
+
+    if (!resolve_etc_dir(etc_dir, sizeof(etc_dir))) {
+        return cgi_fail(500, "managed etc directory unavailable");
+    }
+
+    content[0] = '\0';
+    {
+        char htpasswd_path[PATH_MAX];
+        struct stat sb;
+        FILE *fp = NULL;
+
+        (void)snprintf(htpasswd_path, sizeof(htpasswd_path), "%s/htpasswd",
+                       etc_dir);
+        if (!safe_path(htpasswd_path)) {
+            return cgi_fail(500, "managed htpasswd path rejected");
+        }
+        if (lstat(htpasswd_path, &sb) == 0) {
+            if (!S_ISREG(sb.st_mode)) {
+                return cgi_fail(500, "managed htpasswd is not a regular file");
+            }
+            fp = fopen(htpasswd_path, "rb");
+        } else if (errno == ENOENT) {
+            fp = NULL;                              /* create on first change */
+        } else {
+            return cgi_fail(500, "cannot stat managed htpasswd");
+        }
+        if (fp != NULL) {
+            content_len = fread(content, 1, MAX_HTPASSWD, fp);
+            if (ferror(fp) != 0) {
+                (void)fclose(fp);
+                return cgi_fail(500, "cannot read managed htpasswd");
+            }
+            (void)fclose(fp);
+        }
+        content[content_len] = '\0';
+    }
+
+    choose_target_user(content, content_len, user, sizeof(user));
+
+    if (has_old) {
+        if (!valid_password(old_password)) {
+            return cgi_fail(400, "invalid 'old_password' parameter");
+        }
+        if (!htpasswd_find_user(content, content_len, user,
+                                existing_hash, sizeof(existing_hash)) ||
+            existing_hash[0] == '\0') {
+            return cgi_fail(403, "old password check unavailable");
+        }
+        encoded = crypt(old_password, existing_hash);
+        if (encoded == NULL || strcmp(encoded, existing_hash) != 0) {
+            return cgi_fail(403, "old password does not match");
+        }
+    }
+
+    make_salt(salt);
+    (void)snprintf(setting, sizeof(setting), "$1$%s", salt);
+    encoded = crypt(password, setting);
+    if (encoded == NULL || strncmp(encoded, "$1$", 3) != 0 ||
+        strlen(encoded) >= MAX_HASH) {
+        return cgi_fail(500, "password hash generation failed");
+    }
+    if (!build_htpasswd(content, content_len, user, encoded,
+                        rebuilt, sizeof(rebuilt))) {
+        return cgi_fail(500, "htpasswd too large to rewrite");
+    }
+    if (write_htpasswd_atomic(etc_dir, rebuilt, strlen(rebuilt)) != 0) {
+        return cgi_fail(500, "cannot write managed htpasswd");
+    }
+
+    json_header();
+    printf("{\"ok\":true}\n");                     /* never echo hash/password */
+    return 0;
+}
+
+static int action_chpasswd(void) {
+    char input[MAX_BODY + 1];
+    char password[MAX_PASS + 2];
+    char old_password[MAX_PASS + 2];
+    const char *type = NULL;
+    int has_old = 0;
+    int rc = 0;
+
+    input[0] = '\0';
+    password[0] = '\0';
+    old_password[0] = '\0';
+
+    /* A password in a query string would land in proxy/browser history. */
+    type = getenv("CONTENT_TYPE");
+    if (type == NULL ||
+        strncasecmp(type, "application/x-www-form-urlencoded", 33) != 0) {
+        return cgi_fail(400, "chpasswd requires a form POST");
+    }
+    if (read_body(input, sizeof(input)) != 0) {
+        /* read_body may have copied part of the password before failing. */
+        memset(input, 0, sizeof(input));
+        return cgi_fail(400, "invalid request body");
+    }
+    if (form_value(input, "new_password", password, sizeof(password)) != 0 ||
+        !valid_password(password)) {
+        memset(input, 0, sizeof(input));
+        memset(password, 0, sizeof(password));
+        return cgi_fail(400,
+            "missing, empty, overlong or malformed 'new_password' parameter");
+    }
+
+    has_old = form_has_key(input, "old_password");
+    old_password[0] = '\0';
+    if (has_old &&
+        form_value(input, "old_password", old_password,
+                   sizeof(old_password)) != 0) {
+        has_old = 0;                                /* malformed: ignore */
+    }
+
+    rc = chpasswd_commit(password, old_password, has_old);
+
+    /* Keep plaintext off our stack for as long as the process lives. */
+    memset(input, 0, sizeof(input));
+    memset(password, 0, sizeof(password));
+    memset(old_password, 0, sizeof(old_password));
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -625,6 +1133,9 @@ int main(void) {
     }
     if (strstr(script, "move.cgi") != NULL) {
         return action_move();
+    }
+    if (strstr(script, "chpasswd.cgi") != NULL) {
+        return action_chpasswd();
     }
     return cgi_fail(404, "unknown management action");
 }

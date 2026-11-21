@@ -1,5 +1,76 @@
 # Changelog / 变更记录
 
+## v1.0.8 — 2026-11-22 — 网页改密码 / Web password change
+
+网页管理界面顶部新增「修改密码」按钮与弹窗（新密码 + 确认密码，
+均为 `type=password`，不回显）。两次不一致、空值、控制字符或超过 200
+字节会在前端拦下；确认后向新端点 `/chpasswd.cgi` POST form-urlencoded
+`new_password`。成功后关闭弹窗、清空输入框并明确提示「用新密码重新登录」；
+界面不自动 `refresh()`，之后的 401 会给出「关闭并重新打开浏览器（或清除
+本站登录信息）」的具体指引，避免「页面还能用、一刷新就 401」的困惑。
+浏览器 XHR 的 401 无法可靠触发新的认证弹窗，强行用错凭据触发反而更糟，
+因此选择明确指引用户重开；新口令本身是立即生效的（bozohttpd 每请求重读
+`.htpasswd`）。
+
+后端 `manage.c` 新增 `action_chpasswd()`：用 `crypt(3)`（静态链接
+libcrypt，与 bozohttpd 相同）在 CGI 进程内部生成 `$1$` MD5-crypt hash，
+明文不进 argv / shell / 管道 / 子进程 / 日志，返回前从栈缓冲清零，响应
+不回显密码与 hash。目标文件固定为安装期写入的 `TC_ETC_DIR/htpasswd`
+（旧分发器仅有 `TC_STATE_DIR` 时从其父目录推导 `/etc`），不接受前端路径；
+同目录临时文件 + `rename()` 原子替换、mode `0600`、保留其他用户行。
+支持可选 `old_password` 二次校验（不匹配 `403`），网页端按两字段设计不发送。
+响应：`200 {"ok":true}` / `400` 非法或空密码 / `403` 旧密码不匹配 /
+`500` hash 或写失败。仅接受 form POST，拒绝 GET query，避免口令进 URL/历史。
+
+`install.sh` 生成的 CGI 分发器新增 `*/chpasswd.cgi) exec manage.bin` 并导出
+`TC_ETC_DIR`；`-C .cgi` 下该端点自动受同一份 docroot `.htpasswd` 保护，
+启动参数与鉴权模型未改。此链路是 `deploy/change_password.sh` 的无需 SSH
+等价实现（同一文件、同一 `$1$` 格式、同样的原子/0600/保留其他用户语义）；
+脚本仍供 SSH/自动化使用，且仍是唯一支持 `-u` 显式用户名的接口。
+
+验证：本机 `tests/chpasswd_c_test.c`（7 组：保留其他用户/0600/原子临时文件
+清理/旧密码对错/空与超长与控制字符/GET 拒绝/`TC_STATE_DIR` 回退与
+`REMOTE_USER`/非法路径）与 `tests/index_ui_test.js`（原 5 组 + 新增 3 组
+密码弹窗用例）全部通过；`gcc -Wall -Wextra -fsyntax-only` 原生与交叉均无
+警告，所有 sh `sh -n`、内联 JS `node --check` 通过。`tc_wb` 静态交叉编译后
+`nbfile` + `objdump -p` 确认含 `-lcrypt` 的 `manage.cgi` 仍是纯静态
+earmv4 ELF（无 INTERP/DYNAMIC）。`httpd` 与 `upload.cgi` 未改动，哈希不变；
+`manage.cgi` SHA-256 `de9e015ca2a96660881d52a00b1a2c6b48a43674502ead6656e8697882773120`。
+尚未真机部署，待 QA 验证。
+
+Added a **Change password** button and modal (new password + confirmation,
+both `type=password`) to the top toolbar. Mismatches, empty values, control
+characters and >200-byte values are blocked client-side; submission POSTs
+`new_password` as form data to the new `/chpasswd.cgi` endpoint. On success the
+modal closes, fields are cleared, and the message asks the user to log in again
+with the new password; the UI deliberately does **not** auto-refresh, and any
+later 401 explains how to drop the cached Basic credentials (close and reopen
+the browser or clear site login data). The new password is already live because
+bozohttpd re-reads `.htpasswd` on every request; an XHR 401 cannot reliably
+raise a fresh auth dialog, so explicit guidance is the dependable fix.
+
+`action_chpasswd()` in `manage.c` computes the `$1$` MD5-crypt hash **in
+process** with `crypt(3)` (statically linked libcrypt, as bozohttpd already
+does). Plaintext never reaches argv/shell/pipe/child/log, is zeroed before
+return, and is never echoed with the hash. The target is the install-time-baked
+`TC_ETC_DIR/htpasswd` (derived `/etc` fallback for older dispatchers); no
+client input can choose a path. The write is atomic (same-directory temp +
+`rename()`), mode `0600`, and preserves other users. An optional
+`old_password` check returns `403` on mismatch; the two-field web UI does not
+send it. Only form POST is accepted so passwords cannot enter URLs/history.
+
+The generated dispatcher gains `*/chpasswd.cgi` and exports `TC_ETC_DIR`;
+`-C .cgi` keeps the endpoint under the same docroot Basic auth, with no server
+flag changes. This is the no-SSH equivalent of `deploy/change_password.sh`
+(same file, `$1$` format, atomic/0600/other-user semantics); the script remains
+for SSH/automation and is still the only interface with an explicit `-u` user.
+Verified locally with 7 native C groups, 3 new UI groups (existing 5 still
+pass), warning-free native/cross syntax checks, `sh -n`, `node --check`, and
+`tc_wb` static ELF checks for the new `-lcrypt` link. `httpd`/`upload.cgi`
+hashes unchanged; `manage.cgi` SHA-256
+`de9e015ca2a96660881d52a00b1a2c6b48a43674502ead6656e8697882773120`.
+Not yet deployed to real hardware; QA validation pending.
+
 ## v1.0.7 — 2026-11-21 — 设备上改 Web 密码的辅助脚本 / On-device Web password changer
 
 新增 `deploy/change_password.sh`，由 `install.sh` 安装到设备

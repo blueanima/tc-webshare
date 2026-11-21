@@ -217,7 +217,7 @@ repeating the test.
 Open `http://<device-lan-ip>:8080/` in a browser and pass the Basic auth
 dialog. The hidden management homepage is served automatically; the top
 toolbar offers **file upload** (multiple files, with a live progress bar),
-**new folder**, and refresh. The table below shows top-level entries with
+**new folder**, refresh, and **change password** (v1.0.8). The table below shows top-level entries with
 size, UTC mtime, download link, a **move** button, a **delete** button and
 directory markers, rendered from `/list.cgi` (JSON) without any CDN.
 
@@ -238,6 +238,7 @@ Endpoints (all behind the same docroot `.htpasswd`):
 | `/delete.cgi` | POST `name=...` (form-urlencoded) or GET query | delete one top-level file or empty directory |
 | `/upload.cgi` | POST multipart | existing streaming uploader |
 | `/move.cgi` | POST `name=...&to=...` (form-urlencoded) or GET query | move one top-level entry into an existing top-level folder |
+| `/chpasswd.cgi` | POST `new_password=...` (form-urlencoded; optional `old_password=...`) | rotate the Basic-auth password in managed `etc/htpasswd` (v1.0.8) |
 
 `move.cgi` never overwrites: `name == to` or an existing destination entry
 returns 409, a symlink source/target or a non-directory target returns 403,
@@ -290,6 +291,48 @@ The script preserves other users in `htpasswd`, keeps mode `0600`, rejects
 empty/mismatched passwords, and writes the hash via `openssl passwd -1 -stdin`
 (plaintext is never passed as an argument or stored in a file).
 
+#### Changing the Web password from the browser (v1.0.8)
+
+The toolbar's **修改密码** ("Change password") button opens a modal with a new
+password and a confirmation field. Both are `type=password` (never echoed);
+mismatches, empty values, control characters and values above 200 bytes are
+refused before any request is sent. The form POSTs only `new_password` to
+`/chpasswd.cgi`; a GET query is deliberately rejected so a password can never
+land in a URL or browser history. The endpoint sits behind the same docroot
+`.htpasswd` Basic auth as every other CGI — no bozohttpd flag changes.
+
+The backend computes the `$1$` MD5-crypt hash **inside the CGI process** with
+`crypt(3)` from statically linked libcrypt (the same library bozohttpd links).
+Plaintext never reaches argv, a shell, a pipe, a child process or a log; it is
+zeroed from the CGI's stack buffers before exit, and the response never echoes
+the password or the hash. The target path is fixed at install time
+(`TC_ETC_DIR`, with a `TC_STATE_DIR`-derived fallback for older dispatchers):
+no request value can influence it. The write is atomic (same-directory temp
+file + `rename()`, mode `0600`) and preserves every other htpasswd user.
+
+An optional `old_password` field is checked against the current hash when
+supplied (`403` on mismatch). The web UI does not send it: the request is
+already Basic-authenticated and the specified modal has exactly two fields;
+the check exists for stricter API/script callers. Responses: `200 {"ok":true}`,
+`400` empty/malformed/overlong password, `403` old-password mismatch (when
+sent), `500` hash/write failure.
+
+**After a successful change the browser still holds the OLD Basic-auth
+credentials.** The new password is live immediately (bozohttpd re-reads
+`.htpasswd` per request), but this tab's cached credentials will get 401 on
+the next request. The UI therefore does **not** auto-refresh, tells the user
+to log in again with the new password, and turns any later 401 into an
+explicit hint to close and reopen the browser (or clear this site's login
+data). An XHR 401 cannot reliably raise a fresh browser auth dialog, and
+sending deliberately bad credentials to force one would make things worse;
+a clean re-open is the dependable path. Pressing 刷新列表 right after a change
+shows that hint instead of a confusing generic 401.
+
+This is the no-SSH equivalent of `deploy/change_password.sh`: same file, same
+`$1$` hash format, same atomic / `0600` / preserve-other-users semantics. The
+script remains for SSH or automation and is still the only interface that
+takes an explicit `-u` username override.
+
 ### 7. Verification checklist
 
 - [ ] `netstat -an | sed -n '/LISTEN/p'` shows 8080 (Samba 139/445/548 normally present)
@@ -301,6 +344,7 @@ empty/mismatched passwords, and writes the hash via `openssl passwd -1 -stdin`
 - [ ] duplicate filenames get `.1` suffixes; bad filenames get 400
 - [ ] a Chinese/emoji filename (e.g. `内网算力统筹与工作思路.docx`) uploads with 200 and lands with that exact name; malformed UTF-8 and `../` names still get 400
 - [ ] the 移动 button opens a folder dropdown (excluding itself); with no folder it says `请先新建文件夹`; moving a Chinese-named file returns 200 and the file appears inside the target; a same-name destination returns 409
+- [ ] web UI 修改密码: a mismatched pair is refused locally; a valid change returns 200 and the success message asks for a fresh login; a later 401 explains the stale cache; `etc/htpasswd` stays `0600` with other users intact
 - [ ] `boot.sh` contains exactly one marker block, before the `starting native manager` echo, `|| true` wrapped; Samba still starts
 - [ ] `state/boot.nonweb` matches the non-marker lines of boot.sh
 - [ ] after reboot the boot hook re-mounts the disk via acp and serves from `/Volumes/dk2/share/web`; if acp fails, a loud tmpfs warning is printed
@@ -464,7 +508,7 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 
 *（截图为真机 v1.0.6 版本所摄；说明见 [docs/screenshots/README.md](docs/screenshots/README.md)。）*
 
-浏览器打开 `http://<设备IP>:8080/` 并通过 Basic auth 后，会自动看到隐藏的管理首页：顶部工具栏提供**多文件上传**（带实时进度条）、**新建文件夹**、刷新；下方表格显示顶层文件名、大小、UTC 修改时间、下载链接、**移动**按钮、**删除**按钮与目录标记，由 `/list.cgi`（JSON）渲染，完全离线、无外部 CDN。点击「移动」会从当前列表的文件夹中选择目标（排除自身），确认后调用 `/move.cgi`；若还没有任何文件夹，会提示「请先新建文件夹」。
+浏览器打开 `http://<设备IP>:8080/` 并通过 Basic auth 后，会自动看到隐藏的管理首页：顶部工具栏提供**多文件上传**（带实时进度条）、**新建文件夹**、刷新、**修改密码**（v1.0.8）；下方表格显示顶层文件名、大小、UTC 修改时间、下载链接、**移动**按钮、**删除**按钮与目录标记，由 `/list.cgi`（JSON）渲染，完全离线、无外部 CDN。点击「移动」会从当前列表的文件夹中选择目标（排除自身），确认后调用 `/move.cgi`；若还没有任何文件夹，会提示「请先新建文件夹」。
 
 所选多个文件仍一次性 POST，因此进度条显示**整批**上传进度（`req.upload.onprogress`），上传期间禁用上传按钮。v1.0.5 起进度文字同时显示百分比与**平滑后的实时速度**（如 `45% · 2.3 MB/s`），完成消息附上整批平均速度；成功、网络错误与 `send()` 同步异常都会隐藏进度条并恢复按钮。故意不设 `req.timeout`，避免慢速网络上的大文件被误判超时。
 
@@ -479,6 +523,7 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 | `/delete.cgi` | POST 表单 `name=...` 或 GET query | 删除一个顶层文件或空目录 |
 | `/upload.cgi` | POST multipart | 原有流式上传 |
 | `/move.cgi` | POST 表单 `name=...&to=...` 或 GET query | 把一个顶层条目移动到已存在的顶层文件夹 |
+| `/chpasswd.cgi` | POST 表单 `new_password=...`（可选 `old_password=...`） | 更新托管 `etc/htpasswd` 的 Basic auth 口令（v1.0.8） |
 
 **v1.0.6 中文上传名**：上传文件名现在与文件夹名使用**同一套严格 UTF-8 校验**，`内网算力统筹与工作思路.docx`、emoji 名字等都能正常上传，不再返回 HTTP 400；畸形 UTF-8、分隔符、`..`、控制字节与超过 200 字节的名字仍拒绝，`.gitignore` 这类隐藏文件名仍可上传（详见英文版对应段落）。
 
@@ -498,13 +543,21 @@ printf '%s\n' '新密码' | ssh root@<设备IP> \
 
 脚本会保留 `htpasswd` 中的其他用户、维持 `0600` 权限、拒绝空密码/两次不一致，并通过 `openssl passwd -1 -stdin` 生成 hash（明文既不作为参数也不写入文件）。
 
+**网页直接改 Web 密码（v1.0.8）**：工具栏「修改密码」打开弹窗，输入新密码与确认密码（两者均为 `type=password`，不回显）。两次不一致、空密码、控制字符、超过 200 字节都会在本地拦下，不发出请求；确认后只把 `new_password` 以 form-urlencoded POST 到 `/chpasswd.cgi`（故意拒绝 GET query，避免密码进 URL/历史）。该端点与其他 CGI 一样受 docroot 同一份 `.htpasswd` 的 Basic auth 保护，bozohttpd 启动参数无需改动。
+
+后端在 CGI 进程**内部**调用静态链接 libcrypt 的 `crypt(3)` 生成 `$1$` MD5-crypt hash（与 bozohttpd 链接的是同一套库）。明文不进 argv、shell、管道、子进程或日志，函数返回前从 CGI 栈缓冲清零；响应不回显密码或 hash。目标路径在安装时固定（`TC_ETC_DIR`；旧版分发器只有 `TC_STATE_DIR` 时从其父目录推导），任何请求参数都无法影响它。写入采用同目录临时文件 + `rename()` 的原子替换，权限 `0600`，并保留其他用户。后端支持可选的 `old_password` 二次校验（不匹配返回 `403`）；网页端不发该字段——请求已经过 Basic auth，且弹窗按需求只含两个输入框；该校验供更严格的脚本/API 调用方使用。响应：`200 {"ok":true}`、`400` 空/非法/超长密码、`403` 旧密码不匹配（若提供）、`500` hash 或写失败。
+
+**改完密码后浏览器仍缓存旧口令**：新密码立即生效（bozohttpd 每请求重读 `.htpasswd`），但当前标签页的 Basic auth 缓存会导致下一次请求 401。因此界面**不自动刷新**，成功提示明确要求「用新密码重新登录」，并把之后的 401 改为「请关闭并重新打开浏览器（或清除本站登录信息）」的具体提示。XHR 的 401 不能可靠触发浏览器重新弹认证框，用错误凭据强行触发只会更糟，所以干净地重开浏览器是最稳妥的办法；改完立刻点「刷新列表」会看到这条提示，而不是莫名其妙的通用 401。
+
+这条链路与 `deploy/change_password.sh` 是同一份 `etc/htpasswd`、同一种 `$1$` hash、同样的原子写入 / `0600` / 保留其他用户语义，只是无需 SSH；脚本仍供 SSH/自动化使用，且仍是唯一支持 `-u` 显式指定用户名的接口。
+
 新建/删除/移动的名称接受**可打印 ASCII 字符（0x20–0x7E，含空格与 `! @ # $ % & ' ( ) + , ; = [ ]` 等常见符号）**以及合法 UTF-8 多字节字符（如 `家庭照片`），最长 **200 字节**；仅拒绝 `/`、`\`、前导点（含 `.`、`..`）、C0/C1/DEL 控制字符与畸形 UTF-8，空格和常见符号是允许的。重名建文件夹返回 409。畸形 UTF-8（overlong、代理区、超出 U+10FFFF）同样拒绝，任何字节序列都无法绕过 basename 检查。`list.cgi` 以 `charset=utf-8` 返回原始 UTF-8 JSON，`JSON.parse` 可直接解析。浏览器 `FormData` 不会发送 `Expect: 100-continue`，因此网页上传不需要 curl 的 `-H 'Expect:'` 补丁。
 
 **删除范围刻意收窄且不可恢复**：仅作用于 `TC_SHARE_DIR` 顶层；拒绝符号链接；普通文件用 `unlink()`，目录只用 `rmdir()`（**仅空目录，绝不递归**）；点文件与 `.htpasswd` / `.tc-webshare-index.html` 两个程序文件无法被命名；界面会二次确认。没有回收站、没有撤销，重要数据请自行备份。返回码：`200 {"ok":true,...}`、`400` 非法名、`403` 软链/特殊文件、`404` 不存在、`409` 目录非空、`500` 其他错误。
 
 ### 7. 验证清单 / 8. 回退 / 9. 安全 / 10. 许可
 
-见英文版对应章节：重点确认 8080 LISTEN、401 认证、`/upload.cgi` 上传落点（curl 必须加 `-H 'Expect:'`）、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、开机后 boot hook 通过 acp 重新挂载硬盘并继续使用 `/Volumes/dk2/share/web`（失败时明确告警并回退 Flash 小容量数据目录）、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；`manage.c` 对新建/删除/移动名称执行严格 RFC 3629 UTF-8 校验（合法中文放行，畸形序列、控制字符、分隔符、`..`、前导点、超 200 字节拒绝）；上传文件名在 v1.0.6 起使用同款校验，但保留隐藏文件名（`.gitignore`）可上传；删除仅限合法顶层 basename：`lstat()` 拒绝软链、`rmdir()` 拒绝非空目录、不递归、程序文件与点文件不可命名，且删除不可撤销；移动仅限合法顶层 basename，目标必须是非软链的真实目录，同名条目一律 409，不跨层、不移出共享目录且不可覆盖。GPL-3.0-or-later。
+见英文版对应章节：重点确认 8080 LISTEN、401 认证、网页「修改密码」弹窗（两次不一致本地拦截；成功后提示重新登录；之后的 401 给出清缓存指引；`etc/htpasswd` 仍为 0600 且其他用户保留）、`/upload.cgi` 上传落点（curl 必须加 `-H 'Expect:'`）、标记块在 `starting native manager` 之前且带 `|| true`、`state/boot.nonweb` 一致、开机后 boot hook 通过 acp 重新挂载硬盘并继续使用 `/Volumes/dk2/share/web`（失败时明确告警并回退 Flash 小容量数据目录）、TimeCapsuleSMB 未被改动。`./deploy/uninstall.sh` 默认保留用户数据（包括在管理目录内的回退数据），`--purge-data` 才删除。仅可信有线 LAN 使用明文 HTTP；凭据只以预生成 hash 传入；`manage.c` 对新建/删除/移动名称执行严格 RFC 3629 UTF-8 校验（合法中文放行，畸形序列、控制字符、分隔符、`..`、前导点、超 200 字节拒绝）；上传文件名在 v1.0.6 起使用同款校验，但保留隐藏文件名（`.gitignore`）可上传；删除仅限合法顶层 basename：`lstat()` 拒绝软链、`rmdir()` 拒绝非空目录、不递归、程序文件与点文件不可命名，且删除不可撤销；移动仅限合法顶层 basename，目标必须是非软链的真实目录，同名条目一律 409，不跨层、不移出共享目录且不可覆盖。GPL-3.0-or-later。
 
 **v1.0.6 状态**：已用 `tc_wb` 交叉工具链在本机构建，并用本机文件名策略测试与无头 UI 测试验证；**尚未真机部署**，需 QA 验证后再上线。硬件上已验证的版本仍是 v1.0.3（见下）；v1.0.5 修复了上传响应死锁，v1.0.6 补齐中文 UTF-8 上传文件名并加入「移动到文件夹」。`httpd` 未改动。新 SHA-256：`upload.cgi` `4582a0ca1bfe40adab27a6760d00fa78e4916307fac671ddb472efa818fd98b8`、`manage.cgi` `dca20ba7541d682293daa973ba92f0a04fdd41af7c4a5e8c393a4093d35097b6`；上一版 v1.0.5 `upload.cgi` 为 `04e35d26f7d25d86307f702f1f26a6343c9bb9e471cf5d2fadc648647c0a2cbd`。
 

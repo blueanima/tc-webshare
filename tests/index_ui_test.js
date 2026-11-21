@@ -28,7 +28,9 @@ const created = [];
 const ids = [
   'status', 'rows', 'file', 'folder', 'uploadBtn', 'progressWrap',
   'progressFill', 'progressText', 'refreshBtn', 'mkdirBtn',
-  'moveModal', 'moveInfo', 'moveTarget', 'moveConfirm', 'moveCancel'
+  'moveModal', 'moveInfo', 'moveTarget', 'moveConfirm', 'moveCancel',
+  'passwdBtn', 'passwdModal', 'newPass1', 'newPass2', 'passwdMsg',
+  'passwdConfirm', 'passwdCancel'
 ];
 for (const id of ids) {
   elements[id] = {
@@ -208,5 +210,70 @@ assert.strictEqual(elements.moveModal.hidden, true, 'modal opened with no folder
 assert(elements.status.textContent.indexOf('请先新建文件夹') !== -1,
        'missing hint when no folder exists');
 console.log('5. move empty folders   : OK (' + elements.status.textContent + ')');
+
+/* --- 6. password modal: mismatch is blocked client-side --------------- */
+const pwBefore = xhrs.length;
+elements.passwdBtn.onclick();
+assert.strictEqual(elements.passwdModal.hidden, false, 'passwd modal not shown');
+elements.newPass1.value = 'temporary-A';
+elements.newPass2.value = 'temporary-B';
+elements.passwdConfirm.onclick();
+assert(xhrs.length === pwBefore, 'mismatched passwords must not be sent');
+assert(elements.passwdMsg.textContent.indexOf('不一致') !== -1,
+       'mismatch hint missing: ' + elements.passwdMsg.textContent);
+elements.passwdCancel.onclick();
+assert.strictEqual(elements.passwdModal.hidden, true, 'cancel did not close modal');
+assert.strictEqual(elements.newPass1.value, '', 'cancel did not clear password');
+assert.strictEqual(elements.newPass2.value, '', 'cancel did not clear confirmation');
+console.log('6. password mismatch/cancel  : OK');
+
+/* --- 7. password change success + stale-auth messaging ---------------- */
+elements.passwdBtn.onclick();
+elements.newPass1.value = '临时口令 Test 123';
+elements.newPass2.value = '临时口令 Test 123';
+const listsBeforePw = xhrs.filter((x) => x.url === '/list.cgi').length;
+elements.passwdConfirm.onclick();
+const pwXhr = xhrs.filter((x) => x.url === '/chpasswd.cgi').pop();
+assert(pwXhr, 'no /chpasswd.cgi request created');
+assert.strictEqual(pwXhr.method, 'POST');
+assert.strictEqual(pwXhr.headers['Content-Type'], 'application/x-www-form-urlencoded');
+assert.strictEqual(pwXhr.body,
+  'new_password=' + encodeURIComponent('临时口令 Test 123'),
+  'unexpected password body: ' + pwXhr.body);
+pwXhr.readyState = 4;
+pwXhr.status = 200;
+pwXhr.responseText = '{"ok":true}\n';
+pwXhr.onreadystatechange();
+assert.strictEqual(elements.passwdModal.hidden, true, 'modal not closed on success');
+assert.strictEqual(elements.newPass1.value, '', 'password left in DOM after success');
+assert(elements.status.textContent.indexOf('请用新密码重新登录') !== -1,
+       'success must explain re-login: ' + elements.status.textContent);
+assert(xhrs.filter((x) => x.url === '/list.cgi').length === listsBeforePw,
+       'must not refresh() with stale Basic credentials after a password change');
+/* Any later 401 must explain the stale cache instead of a generic hint. */
+elements.refreshBtn.onclick();
+const refreshAfterPw = xhrs.filter((x) => x.url === '/list.cgi').pop();
+refreshAfterPw.readyState = 4;
+refreshAfterPw.status = 401;
+refreshAfterPw.onreadystatechange();
+assert(elements.status.textContent.indexOf('关闭并重新打开浏览器') !== -1,
+       'stale-auth hint missing after 401: ' + elements.status.textContent);
+console.log('7. password success/re-login  : OK');
+
+/* --- 8. backend error is shown from the JSON error field -------------- */
+elements.passwdBtn.onclick();
+elements.newPass1.value = 'another-temporary';
+elements.newPass2.value = 'another-temporary';
+elements.passwdConfirm.onclick();
+const pwFail = xhrs.filter((x) => x.url === '/chpasswd.cgi').pop();
+pwFail.readyState = 4;
+pwFail.status = 400;
+pwFail.responseText = '{"ok":false,"error":"malformed new_password"}';
+pwFail.onreadystatechange();
+assert.strictEqual(elements.passwdModal.hidden, false, 'modal must stay open on failure');
+assert(elements.passwdMsg.textContent.indexOf('malformed new_password') !== -1,
+       'backend error not shown inside modal: ' + elements.passwdMsg.textContent);
+assert.strictEqual(elements.passwdConfirm.disabled, false, 'confirm stuck disabled');
+console.log('8. password backend error     : OK');
 
 console.log('ALL UI TESTS PASSED');

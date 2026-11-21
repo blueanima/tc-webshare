@@ -20,7 +20,7 @@ main{max-width:1000px;margin:24px auto;padding:0 20px}
 .field{display:flex;flex-direction:column;gap:6px}
 .field label{font-size:12px;color:var(--muted)}
 .row{display:flex;gap:8px;align-items:center}
-input[type=text],input[type=file]{border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:#fff;font:inherit;max-width:280px}
+input[type=text],input[type=password],input[type=file]{border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:#fff;font:inherit;max-width:280px}
 button,.btn{border:0;border-radius:6px;background:var(--accent);color:#fff;padding:9px 14px;font:inherit;cursor:pointer;text-decoration:none;display:inline-block}
 button:hover,.btn:hover{filter:brightness(.95)}
 button:disabled{opacity:.5;cursor:not-allowed}
@@ -47,6 +47,7 @@ button.secondary{background:var(--muted)}
 .modal-card h2{margin:0 0 10px;font-size:16px}
 .modal-card p{margin:0 0 12px;color:var(--muted);font-size:13px;word-break:break-all}
 .modal-card label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+.modal-card .msg{min-height:18px;margin:8px 0 0;font-size:12px;color:var(--danger)}
 select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:#fff;font:inherit;max-width:100%;margin-bottom:14px}
 </style>
 </head>
@@ -75,6 +76,10 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
       <div class="field">
         <label>&nbsp;</label>
         <button id="refreshBtn" type="button">刷新列表</button>
+      </div>
+      <div class="field">
+        <label>&nbsp;</label>
+        <button id="passwdBtn" type="button" class="secondary">修改密码</button>
       </div>
     </div>
     <div class="status" id="status"></div>
@@ -105,6 +110,22 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
   </div>
 </div>
 
+<div class="modal" id="passwdModal" hidden>
+  <div class="modal-card">
+    <h2>修改 Web 共享密码</h2>
+    <p>新密码立即生效；但浏览器仍缓存旧口令，改完后需重新登录。</p>
+    <label for="newPass1">新密码（最多 200 字节）</label>
+    <input type="password" id="newPass1" autocomplete="new-password" maxlength="200">
+    <label for="newPass2">确认新密码</label>
+    <input type="password" id="newPass2" autocomplete="new-password" maxlength="200">
+    <p class="msg" id="passwdMsg"></p>
+    <div class="row">
+      <button id="passwdConfirm" type="button">确认修改</button>
+      <button id="passwdCancel" type="button" class="secondary">取消</button>
+    </div>
+  </div>
+</div>
+
 <script>
 (function () {
   'use strict';
@@ -121,8 +142,20 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
   var moveTarget = document.getElementById('moveTarget');
   var moveConfirm = document.getElementById('moveConfirm');
   var moveCancel = document.getElementById('moveCancel');
+  var passwdBtn = document.getElementById('passwdBtn');
+  var passwdModal = document.getElementById('passwdModal');
+  var newPass1 = document.getElementById('newPass1');
+  var newPass2 = document.getElementById('newPass2');
+  var passwdMsg = document.getElementById('passwdMsg');
+  var passwdConfirm = document.getElementById('passwdConfirm');
+  var passwdCancel = document.getElementById('passwdCancel');
   var currentEntries = [];
   var moveSource = '';
+  /* A successful password change leaves this tab holding the OLD Basic-auth
+   * credentials.  Every later request will 401 until the browser's cache is
+   * dropped; remember that so the message explains the cause instead of a
+   * generic "session expired". */
+  var authStale = false;
 
   /* v1.0.5: XHR onprogress fires in bursts, so sample at most ~8x/second and
    * smooth with an exponential moving average to keep the speed readable. */
@@ -174,6 +207,29 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
   function status(text, isError) {
     statusEl.textContent = text || '';
     statusEl.className = 'status' + (isError ? ' err' : '');
+  }
+
+  function authHint() {
+    return authStale
+      ? '密码已修改：请关闭并重新打开浏览器（或清除本站登录信息），再用新密码登录。'
+      : '会话认证已失效，请重新输入用户名/口令。';
+  }
+
+  function utf8Bytes(text) {
+    if (typeof TextEncoder === 'function') {
+      try { return new TextEncoder().encode(text).length; } catch (e) { /* fallback */ }
+    }
+    var n = 0;
+    for (var i = 0; i < text.length; i++) {
+      var c = text.charCodeAt(i);
+      if (c < 0x80) n++;
+      else if (c < 0x800) n += 2;
+      else if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length &&
+               text.charCodeAt(i + 1) >= 0xdc00 &&
+               text.charCodeAt(i + 1) <= 0xdfff) { n += 4; i++; }
+      else n += 3;
+    }
+    return n;
   }
 
   function escapeHtml(s) {
@@ -303,7 +359,7 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
         status('已移动：' + from + ' → ' + to);
         return;
       }
-      if (req.status === 401) { status('会话认证已失效，请重新输入用户名/口令。', true); return; }
+      if (req.status === 401) { status(authHint(), true); return; }
       if (req.status === 400) { status('移动失败：名称不合法', true); return; }
       if (req.status === 403) { status('移动失败：' + errorText(req), true); return; }
       if (req.status === 404) { status('移动失败：源或目标文件夹不存在', true); return; }
@@ -325,6 +381,86 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
   moveConfirm.onclick = submitMove;
   moveCancel.onclick = closeMove;
 
+  function openPasswd() {
+    newPass1.value = '';
+    newPass2.value = '';
+    passwdMsg.textContent = '';
+    passwdModal.hidden = false;
+    if (typeof newPass1.focus === 'function') newPass1.focus();
+  }
+
+  function closePasswd() {
+    passwdModal.hidden = true;
+    newPass1.value = '';
+    newPass2.value = '';
+    passwdMsg.textContent = '';
+  }
+
+  function submitPasswd() {
+    var pass = newPass1.value;
+    if (!pass) { passwdMsg.textContent = '请输入新密码'; return; }
+    if (pass !== newPass2.value) { passwdMsg.textContent = '两次密码不一致'; return; }
+    if (/[\x00-\x1f\x7f]/.test(pass)) { passwdMsg.textContent = '密码不能包含控制字符'; return; }
+    if (utf8Bytes(pass) > 200) { passwdMsg.textContent = '密码不能超过 200 字节'; return; }
+
+    passwdMsg.textContent = '';
+    passwdConfirm.disabled = true;
+    status('正在修改密码…');
+    var req = new XMLHttpRequest();
+    var done = false;
+    req.open('POST', '/chpasswd.cgi', true);
+    req.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+
+    function finish(ok, message, isError) {
+      if (done) return;
+      done = true;
+      passwdConfirm.disabled = false;
+      newPass1.value = '';
+      newPass2.value = '';
+      if (ok) {
+        authStale = true;
+        closePasswd();
+      }
+      status(message, isError);
+    }
+
+    req.onreadystatechange = function () {
+      if (req.readyState !== 4 || done) return;
+      if (req.status === 200) {
+        /* No refresh(): the cached old credentials would immediately 401
+         * and hide this explanation.  authStale makes any later 401 say why. */
+        finish(true,
+          '密码已修改，请用新密码重新登录：请关闭并重新打开浏览器（或清除本站登录信息）后重新登录；当前页面仍缓存旧口令，直接刷新会提示认证失败。',
+          false);
+        return;
+      }
+      if (req.status === 401) { finish(false, authHint(), true); return; }
+      if (req.status === 400) {
+        passwdMsg.textContent = '修改失败：' + errorText(req);
+        finish(false, '修改失败：' + errorText(req), true);
+        return;
+      }
+      if (req.status === 403) {
+        passwdMsg.textContent = '修改失败：' + errorText(req);
+        finish(false, '修改失败：' + errorText(req), true);
+        return;
+      }
+      finish(false, '修改失败：HTTP ' + req.status + ' ' + errorText(req), true);
+    };
+    req.onerror = function () {
+      finish(false, '修改失败：网络错误，请检查连接后重试', true);
+    };
+    try {
+      req.send('new_password=' + encodeURIComponent(pass));
+    } catch (err) {
+      finish(false, '修改失败：' + err.message, true);
+    }
+  }
+
+  passwdBtn.onclick = openPasswd;
+  passwdConfirm.onclick = submitPasswd;
+  passwdCancel.onclick = closePasswd;
+
   function deleteEntry(name, isDir) {
     var question = isDir
       ? '确认删除文件夹「' + name + '」？（仅空文件夹可删除）'
@@ -336,7 +472,7 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
     req.onreadystatechange = function () {
       if (req.readyState !== 4) return;
       if (req.status === 200) { status('已删除：' + name); refresh(); return; }
-      if (req.status === 401) { status('会话认证已失效，请重新输入用户名/口令。', true); return; }
+      if (req.status === 401) { status(authHint(), true); return; }
       if (req.status === 404) { status('删除失败：条目不存在', true); return; }
       if (req.status === 409) { status('删除失败：文件夹非空，请先清空内容', true); return; }
       status('删除失败：HTTP ' + req.status + ' ' + req.responseText, true);
@@ -350,7 +486,7 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
     req.open('GET', '/list.cgi', true);
     req.onreadystatechange = function () {
       if (req.readyState !== 4) return;
-      if (req.status === 401) { status('会话认证已失效，请重新输入用户名/口令。', true); return; }
+      if (req.status === 401) { status(authHint(), true); return; }
       if (req.status !== 200) { status('列表读取失败：HTTP ' + req.status, true); return; }
       try { render(JSON.parse(req.responseText)); }
       catch (err) { status('列表解析失败', true); }
@@ -430,7 +566,7 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
         var suffix = avg > 0 ? ' · 平均 ' + formatSpeed(avg) : '';
         finalize(true, '上传完成：' + String(req.responseText).trim() + suffix, false);
       } else if (req.status === 401) {
-        finalize(false, '会话认证已失效，请重新输入用户名/口令。', true);
+        finalize(false, authHint(), true);
       } else {
         finalize(false, '上传失败：HTTP ' + req.status + ' ' + req.responseText, true);
       }

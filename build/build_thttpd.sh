@@ -77,8 +77,12 @@ say "CC ${PKG_ROOT}/src/upload.c"
 ${CC} ${CFLAGS} -o "${STAGE_BIN_DIR}/upload.cgi" "${PKG_ROOT}/src/upload.c"
 
 say "CC ${PKG_ROOT}/src/manage.c"
+# v1.0.8: /chpasswd.cgi computes the MD5-crypt hash in-process with crypt(3).
+# NetBSD's libcrypt.a is in the sysroot and bozohttpd itself links -lcrypt;
+# with -static the result stays a pure static ELF (verified below).  No
+# password is ever passed to a subprocess, pipe, shell or argv.
 # shellcheck disable=SC2086
-${CC} ${CFLAGS} -o "${STAGE_BIN_DIR}/manage.cgi" "${PKG_ROOT}/src/manage.c"
+${CC} ${CFLAGS} -o "${STAGE_BIN_DIR}/manage.cgi" "${PKG_ROOT}/src/manage.c" -lcrypt
 
 # Strip if available; failure to strip is non-fatal.
 if [ -x "${STRIP}" ]; then
@@ -118,6 +122,7 @@ verify_static "${STAGE_BIN_DIR}/manage.cgi"
     printf 'sysroot=%s\n' "${SYSROOT}"
     printf 'src_root=%s\n' "${SRC_ROOT}"
     printf 'cflags=%s\n' "${BASE_CFLAGS}"
+    printf 'manage_cgi_ldflags=-lcrypt\n'
     printf 'httpd_sha256=%s\n' "$(sha256sum "${STAGE_BIN_DIR}/httpd" | awk '{print $1}')"
     printf 'upload_cgi_sha256=%s\n' "$(sha256sum "${STAGE_BIN_DIR}/upload.cgi" | awk '{print $1}')"
     printf 'manage_cgi_sha256=%s\n' "$(sha256sum "${STAGE_BIN_DIR}/manage.cgi" | awk '{print $1}')"
