@@ -49,37 +49,47 @@ button.secondary{background:var(--muted)}
 .modal-card label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
 .modal-card .msg{min-height:18px;margin:8px 0 0;font-size:12px;color:var(--danger)}
 select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:#fff;font:inherit;max-width:100%;margin-bottom:14px}
+.field select{margin-bottom:0}
 </style>
 </head>
 <body>
+<!-- All visible copy below is filled by setLang() from the I18N table.
+     The only literal language names are the endonyms in the <select>. -->
 <header>
-  <h1>tc-webshare · 文件共享</h1>
-  <p>AirPort Time Capsule · 局域网明文 HTTP（仅可信内网使用）</p>
+  <h1 id="appTitle"></h1>
+  <p id="appSubtitle"></p>
 </header>
 <main>
   <section class="panel">
     <div class="tools">
       <div class="field">
-        <label for="file">上传文件</label>
+        <label for="file" id="labelFile"></label>
         <div class="row">
           <input type="file" id="file" multiple>
-          <button id="uploadBtn" type="button">上传</button>
+          <button id="uploadBtn" type="button"></button>
         </div>
       </div>
       <div class="field">
-        <label for="folder">新建文件夹</label>
+        <label for="folder" id="labelFolder"></label>
         <div class="row">
-          <input type="text" id="folder" placeholder="名称：字母/数字/中文/._-" maxlength="200" title="最多 200 字节（中文约 66 字）；不能以 . 开头，不能含 / 或 \">
-          <button id="mkdirBtn" type="button">创建</button>
+          <input type="text" id="folder" maxlength="200">
+          <button id="mkdirBtn" type="button"></button>
         </div>
       </div>
       <div class="field">
         <label>&nbsp;</label>
-        <button id="refreshBtn" type="button">刷新列表</button>
+        <button id="refreshBtn" type="button"></button>
       </div>
       <div class="field">
         <label>&nbsp;</label>
-        <button id="passwdBtn" type="button" class="secondary">修改密码</button>
+        <button id="passwdBtn" type="button" class="secondary"></button>
+      </div>
+      <div class="field">
+        <label for="langSelect" id="langLabel"></label>
+        <select id="langSelect">
+          <option value="zh">中文</option>
+          <option value="en">English</option>
+        </select>
       </div>
     </div>
     <div class="status" id="status"></div>
@@ -91,37 +101,37 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
 
   <section class="panel">
     <table>
-      <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead>
-      <tbody id="rows"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+      <thead><tr><th id="thName"></th><th id="thSize"></th><th id="thMtime"></th><th id="thOp"></th></tr></thead>
+      <tbody id="rows"></tbody>
     </table>
   </section>
 </main>
 
 <div class="modal" id="moveModal" hidden>
   <div class="modal-card">
-    <h2>移动到文件夹</h2>
+    <h2 id="moveTitle"></h2>
     <p id="moveInfo"></p>
-    <label for="moveTarget">目标文件夹</label>
+    <label for="moveTarget" id="moveTargetLabel"></label>
     <select id="moveTarget"></select>
     <div class="row">
-      <button id="moveConfirm" type="button">确认移动</button>
-      <button id="moveCancel" type="button" class="secondary">取消</button>
+      <button id="moveConfirm" type="button"></button>
+      <button id="moveCancel" type="button" class="secondary"></button>
     </div>
   </div>
 </div>
 
 <div class="modal" id="passwdModal" hidden>
   <div class="modal-card">
-    <h2>修改 Web 共享密码</h2>
-    <p>新密码立即生效；但浏览器仍缓存旧口令，改完后需重新登录。</p>
-    <label for="newPass1">新密码（最多 200 字节）</label>
+    <h2 id="passwdTitle"></h2>
+    <p id="passwdDesc"></p>
+    <label for="newPass1" id="passwdLabel1"></label>
     <input type="password" id="newPass1" autocomplete="new-password" maxlength="200">
-    <label for="newPass2">确认新密码</label>
+    <label for="newPass2" id="passwdLabel2"></label>
     <input type="password" id="newPass2" autocomplete="new-password" maxlength="200">
     <p class="msg" id="passwdMsg"></p>
     <div class="row">
-      <button id="passwdConfirm" type="button">确认修改</button>
-      <button id="passwdCancel" type="button" class="secondary">取消</button>
+      <button id="passwdConfirm" type="button"></button>
+      <button id="passwdCancel" type="button" class="secondary"></button>
     </div>
   </div>
 </div>
@@ -129,6 +139,196 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
 <script>
 (function () {
   'use strict';
+
+  /* ------------------------------------------------------------------
+   * i18n: every visible string lives here.  Keys are identical in both
+   * tables so a missing translation can be detected at a glance.  The
+   * UI defaults to Chinese; localStorage only overrides it when the
+   * stored value is exactly 'en'.  No external i18n library or CDN.
+   * ------------------------------------------------------------------ */
+  var LANG_KEY = 'tcws-lang';
+  var I18N = {
+    zh: {
+      'app.title': 'tc-webshare · 文件共享',
+      'app.subtitle': 'AirPort Time Capsule · 局域网明文 HTTP（仅可信内网使用）',
+      'ui.language': '界面语言',
+      'label.upload': '上传文件',
+      'label.folder': '新建文件夹',
+      'btn.upload': '上传',
+      'btn.mkdir': '创建',
+      'btn.refresh': '刷新列表',
+      'btn.passwd': '修改密码',
+      'folder.placeholder': '名称：字母/数字/中文/._-',
+      'folder.title': '最多 200 字节（中文约 66 字）；不能以 . 开头，不能含 / 或 \\',
+      'table.name': '名称',
+      'table.size': '大小',
+      'table.mtime': '修改时间',
+      'table.op': '操作',
+      'list.loading': '加载中…',
+      'list.empty': '目录为空',
+      'op.download': '下载',
+      'op.move': '移动',
+      'op.moveTitle': '移动到当前目录中的另一个文件夹',
+      'op.delete': '删除',
+      'op.deleteDirTitle': '仅可删除空文件夹',
+      'op.deleteFileTitle': '此操作不可恢复',
+      'move.title': '移动到文件夹',
+      'move.info': '将「{name}」移动到选中的文件夹（同名条目不会被覆盖）。',
+      'move.targetLabel': '目标文件夹',
+      'move.confirm': '确认移动',
+      'cancel': '取消',
+      'passwd.title': '修改 Web 共享密码',
+      'passwd.desc': '新密码立即生效；但浏览器仍缓存旧口令，改完后需重新登录。',
+      'passwd.label1': '新密码（最多 200 字节）',
+      'passwd.label2': '确认新密码',
+      'passwd.confirm': '确认修改',
+      'auth.stale': '密码已修改：请关闭并重新打开浏览器（或清除本站登录信息），再用新密码登录。',
+      'auth.invalid': '会话认证已失效，请重新输入用户名/口令。',
+      'status.moving': '正在移动…',
+      'status.moved': '已移动：{from} → {to}',
+      'err.move.invalidName': '移动失败：名称不合法',
+      'err.move.failed': '移动失败：{detail}',
+      'err.move.missing': '移动失败：源或目标文件夹不存在',
+      'err.move.http': '移动失败：HTTP {code} {detail}',
+      'err.move.network': '移动失败：网络错误，请检查连接后重试',
+      'err.mkdir.first': '请先新建文件夹',
+      'passwd.empty': '请输入新密码',
+      'passwd.mismatch': '两次密码不一致',
+      'passwd.control': '密码不能包含控制字符',
+      'passwd.toolong': '密码不能超过 200 字节',
+      'status.passwd.changing': '正在修改密码…',
+      'passwd.success': '密码已修改，请用新密码重新登录：请关闭并重新打开浏览器（或清除本站登录信息）后重新登录；当前页面仍缓存旧口令，直接刷新会提示认证失败。',
+      'err.passwd.failed': '修改失败：{detail}',
+      'err.passwd.http': '修改失败：HTTP {code} {detail}',
+      'err.passwd.network': '修改失败：网络错误，请检查连接后重试',
+      'confirm.deleteDir': '确认删除文件夹「{name}」？（仅空文件夹可删除）',
+      'confirm.deleteFile': '确认删除文件「{name}」？此操作不可恢复。',
+      'status.deleted': '已删除：{name}',
+      'err.delete.missing': '删除失败：条目不存在',
+      'err.delete.notEmpty': '删除失败：文件夹非空，请先清空内容',
+      'err.delete.http': '删除失败：HTTP {code} {detail}',
+      'err.list.http': '列表读取失败：HTTP {code}',
+      'err.list.parse': '列表解析失败',
+      'err.mkdir.name': '请输入文件夹名称',
+      'status.mkdir.done': '已创建：{name}',
+      'err.mkdir.http': '创建失败：HTTP {code}',
+      'err.upload.noFile': '请先选择文件',
+      'status.avg': ' · 平均 {speed}',
+      'status.uploaded': '上传完成：{detail}{avg}',
+      'err.upload.http': '上传失败：HTTP {code} {detail}',
+      'err.upload.network': '上传失败：网络错误，请检查连接后重试',
+      'status.uploading': '正在上传…',
+      'err.upload.failed': '上传失败：{detail}'
+    },
+    en: {
+      'app.title': 'tc-webshare · File Sharing',
+      'app.subtitle': 'AirPort Time Capsule · Plaintext HTTP on the LAN (trusted networks only)',
+      'ui.language': 'Language',
+      'label.upload': 'Upload files',
+      'label.folder': 'New folder',
+      'btn.upload': 'Upload',
+      'btn.mkdir': 'Create',
+      'btn.refresh': 'Refresh list',
+      'btn.passwd': 'Change password',
+      'folder.placeholder': 'Name: letters / digits / CJK / ._-',
+      'folder.title': 'Max 200 bytes (about 66 CJK chars); must not start with a dot and must not contain / or \\',
+      'table.name': 'Name',
+      'table.size': 'Size',
+      'table.mtime': 'Modified',
+      'table.op': 'Actions',
+      'list.loading': 'Loading…',
+      'list.empty': 'This folder is empty',
+      'op.download': 'Download',
+      'op.move': 'Move',
+      'op.moveTitle': 'Move into another folder in the current directory',
+      'op.delete': 'Delete',
+      'op.deleteDirTitle': 'Only empty folders can be deleted',
+      'op.deleteFileTitle': 'This action is irreversible',
+      'move.title': 'Move to folder',
+      'move.info': 'Move "{name}" into the selected folder (existing entries with the same name will not be overwritten).',
+      'move.targetLabel': 'Destination folder',
+      'move.confirm': 'Move',
+      'cancel': 'Cancel',
+      'passwd.title': 'Change web sharing password',
+      'passwd.desc': 'The new password takes effect immediately, but the browser still caches the old credentials. Sign in again after changing it.',
+      'passwd.label1': 'New password (max 200 bytes)',
+      'passwd.label2': 'Confirm new password',
+      'passwd.confirm': 'Change password',
+      'auth.stale': 'Password changed: close and reopen the browser (or clear site login data), then sign in with the new password.',
+      'auth.invalid': 'Session authentication expired. Please enter your username and password again.',
+      'status.moving': 'Moving…',
+      'status.moved': 'Moved: {from} → {to}',
+      'err.move.invalidName': 'Move failed: invalid name',
+      'err.move.failed': 'Move failed: {detail}',
+      'err.move.missing': 'Move failed: source or destination folder does not exist',
+      'err.move.http': 'Move failed: HTTP {code} {detail}',
+      'err.move.network': 'Move failed: network error. Check your connection and try again.',
+      'err.mkdir.first': 'Create a folder first',
+      'passwd.empty': 'Enter a new password',
+      'passwd.mismatch': 'Passwords do not match',
+      'passwd.control': 'Password cannot contain control characters',
+      'passwd.toolong': 'Password must be 200 bytes or fewer',
+      'status.passwd.changing': 'Changing password…',
+      'passwd.success': 'Password changed. Sign in again with the new password: close and reopen the browser (or clear site login data), then sign in. This tab still caches the old credentials, so refreshing it now will fail authentication.',
+      'err.passwd.failed': 'Password change failed: {detail}',
+      'err.passwd.http': 'Password change failed: HTTP {code} {detail}',
+      'err.passwd.network': 'Password change failed: network error. Check your connection and try again.',
+      'confirm.deleteDir': 'Delete folder "{name}"? (Only empty folders can be deleted.)',
+      'confirm.deleteFile': 'Delete file "{name}"? This action is irreversible.',
+      'status.deleted': 'Deleted: {name}',
+      'err.delete.missing': 'Delete failed: item not found',
+      'err.delete.notEmpty': 'Delete failed: folder is not empty. Empty it first.',
+      'err.delete.http': 'Delete failed: HTTP {code} {detail}',
+      'err.list.http': 'Could not load listing: HTTP {code}',
+      'err.list.parse': 'Could not parse the file listing',
+      'err.mkdir.name': 'Enter a folder name',
+      'status.mkdir.done': 'Created: {name}',
+      'err.mkdir.http': 'Create failed: HTTP {code}',
+      'err.upload.noFile': 'Select a file first',
+      'status.avg': ' · avg {speed}',
+      'status.uploaded': 'Upload complete: {detail}{avg}',
+      'err.upload.http': 'Upload failed: HTTP {code} {detail}',
+      'err.upload.network': 'Upload failed: network error. Check your connection and try again.',
+      'status.uploading': 'Uploading…',
+      'err.upload.failed': 'Upload failed: {detail}'
+    }
+  };
+
+  /* Static HTML nodes: id -> translated key (textContent or attribute). */
+  var STATIC_BINDINGS = [
+    {id: 'appTitle', key: 'app.title'},
+    {id: 'appSubtitle', key: 'app.subtitle'},
+    {id: 'langLabel', key: 'ui.language'},
+    {id: 'labelFile', key: 'label.upload'},
+    {id: 'labelFolder', key: 'label.folder'},
+    {id: 'uploadBtn', key: 'btn.upload'},
+    {id: 'mkdirBtn', key: 'btn.mkdir'},
+    {id: 'refreshBtn', key: 'btn.refresh'},
+    {id: 'passwdBtn', key: 'btn.passwd'},
+    {id: 'folder', key: 'folder.placeholder', attr: 'placeholder'},
+    {id: 'folder', key: 'folder.title', attr: 'title'},
+    {id: 'thName', key: 'table.name'},
+    {id: 'thSize', key: 'table.size'},
+    {id: 'thMtime', key: 'table.mtime'},
+    {id: 'thOp', key: 'table.op'},
+    {id: 'moveTitle', key: 'move.title'},
+    {id: 'moveTargetLabel', key: 'move.targetLabel'},
+    {id: 'moveConfirm', key: 'move.confirm'},
+    {id: 'moveCancel', key: 'cancel'},
+    {id: 'passwdTitle', key: 'passwd.title'},
+    {id: 'passwdDesc', key: 'passwd.desc'},
+    {id: 'passwdLabel1', key: 'passwd.label1'},
+    {id: 'passwdLabel2', key: 'passwd.label2'},
+    {id: 'passwdConfirm', key: 'passwd.confirm'},
+    {id: 'passwdCancel', key: 'cancel'}
+  ];
+
+  var lang = 'zh';
+  var lastStatus = null;
+  var lastPasswdMsg = null;
+  var lastMoveInfoName = '';
+  var hasList = false;
+
   var statusEl = document.getElementById('status');
   var rowsEl = document.getElementById('rows');
   var fileEl = document.getElementById('file');
@@ -137,6 +337,7 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
   var progressWrap = document.getElementById('progressWrap');
   var progressFill = document.getElementById('progressFill');
   var progressText = document.getElementById('progressText');
+  var langSelect = document.getElementById('langSelect');
   var moveModal = document.getElementById('moveModal');
   var moveInfo = document.getElementById('moveInfo');
   var moveTarget = document.getElementById('moveTarget');
@@ -168,6 +369,60 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
   var speedValue = 0;
   var batchBytes = 0;
 
+  function t(key, params) {
+    var table = I18N[lang] || I18N.zh;
+    var text = Object.prototype.hasOwnProperty.call(table, key)
+      ? table[key] : (I18N.zh[key] || key);
+    if (!params) return text;
+    return String(text).replace(/\{(\w+)\}/g, function (match, name) {
+      return Object.prototype.hasOwnProperty.call(params, name)
+        ? String(params[name]) : match;
+    });
+  }
+
+  function loadLang() {
+    try {
+      if (typeof localStorage === 'undefined' || !localStorage) return 'zh';
+      return localStorage.getItem(LANG_KEY) === 'en' ? 'en' : 'zh';
+    } catch (err) {
+      return 'zh';
+    }
+  }
+
+  function saveLang(value) {
+    try {
+      if (typeof localStorage === 'undefined' || !localStorage) return;
+      localStorage.setItem(LANG_KEY, value);
+    } catch (err) {
+      /* Disabled storage (private mode): the choice still applies in memory. */
+    }
+  }
+
+  function setLang(next) {
+    lang = next === 'en' ? 'en' : 'zh';
+    if (document.documentElement) {
+      document.documentElement.lang = lang === 'en' ? 'en' : 'zh-CN';
+    }
+    STATIC_BINDINGS.forEach(function (binding) {
+      var el = document.getElementById(binding.id);
+      if (!el) return;
+      if (binding.attr) el[binding.attr] = t(binding.key);
+      else el.textContent = t(binding.key);
+    });
+    if (langSelect) langSelect.value = lang;
+    /* Re-render every already-visible dynamic string without a new request. */
+    if (lastStatus) status(t(lastStatus.key, lastStatus.params), lastStatus.isError);
+    if (lastPasswdMsg) passwdMsg.textContent = t(lastPasswdMsg.key, lastPasswdMsg.params);
+    if (lastMoveInfoName && !moveModal.hidden) setMoveInfo(lastMoveInfoName);
+    if (hasList) render(currentEntries);
+    else showLoading();
+    saveLang(lang);
+  }
+
+  if (langSelect) {
+    langSelect.onchange = function () { setLang(langSelect.value); };
+  }
+
   function nowMs() {
     return (window.performance && typeof performance.now === 'function')
       ? performance.now() : Date.now();
@@ -182,11 +437,11 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
   }
 
   function resetSpeed() {
-    var t = nowMs();
+    var t0 = nowMs();
     speedLastLoaded = 0;
-    speedLastTime = t;
-    speedStart = t;
-    speedSeen = t;
+    speedLastTime = t0;
+    speedStart = t0;
+    speedSeen = t0;
     speedValue = 0;
     batchBytes = 0;
   }
@@ -209,10 +464,35 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
     statusEl.className = 'status' + (isError ? ' err' : '');
   }
 
-  function authHint() {
-    return authStale
-      ? '密码已修改：请关闭并重新打开浏览器（或清除本站登录信息），再用新密码登录。'
-      : '会话认证已失效，请重新输入用户名/口令。';
+  function setStatus(key, params, isError) {
+    var values = params || {};
+    lastStatus = {key: key, params: values, isError: !!isError};
+    status(t(key, values), !!isError);
+  }
+
+  function clearStatus() {
+    lastStatus = null;
+    status('', false);
+  }
+
+  function setPasswdMsg(key, params) {
+    var values = params || {};
+    lastPasswdMsg = {key: key, params: values};
+    passwdMsg.textContent = t(key, values);
+  }
+
+  function clearPasswdMsg() {
+    lastPasswdMsg = null;
+    passwdMsg.textContent = '';
+  }
+
+  function setMoveInfo(name) {
+    lastMoveInfoName = name;
+    moveInfo.textContent = t('move.info', {name: name});
+  }
+
+  function authHintKey() {
+    return authStale ? 'auth.stale' : 'auth.invalid';
   }
 
   function utf8Bytes(text) {
@@ -246,11 +526,20 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
     return v.toFixed(v >= 10 ? 0 : 1) + ' ' + u[i];
   }
 
+  function showLoading() {
+    hasList = false;
+    currentEntries = [];
+    rowsEl.innerHTML = '<tr><td colspan="4" class="empty">' +
+      escapeHtml(t('list.loading')) + '</td></tr>';
+  }
+
   function render(entries) {
     currentEntries = entries.slice();
+    hasList = true;
     rowsEl.innerHTML = '';
     if (!entries.length) {
-      rowsEl.innerHTML = '<tr><td colspan="4" class="empty">目录为空</td></tr>';
+      rowsEl.innerHTML = '<tr><td colspan="4" class="empty">' +
+        escapeHtml(t('list.empty')) + '</td></tr>';
       return;
     }
     entries.forEach(function (e) {
@@ -277,15 +566,16 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
       if (!e.dir) {
         var dl = document.createElement('a');
         dl.href = '/' + encodeURIComponent(e.name);
-        dl.textContent = '下载';
+        dl.textContent = t('op.download');
         op.appendChild(dl);
       }
-      /* 移动按钮位于下载与删除之间；目标来自当前列表里的目录。 */
+      /* The move button sits between download and delete; its target list
+       * comes from the directories in the current listing. */
       var mv = document.createElement('button');
       mv.type = 'button';
       mv.className = 'mini';
-      mv.textContent = '移动';
-      mv.title = '移动到当前目录中的另一个文件夹';
+      mv.textContent = t('op.move');
+      mv.title = t('op.moveTitle');
       mv.onclick = (function (entryName) {
         return function () { openMove(entryName); };
       })(e.name);
@@ -293,8 +583,8 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
       var del = document.createElement('button');
       del.type = 'button';
       del.className = 'mini danger';
-      del.textContent = '删除';
-      del.title = e.dir ? '仅可删除空文件夹' : '此操作不可恢复';
+      del.textContent = t('op.delete');
+      del.title = e.dir ? t('op.deleteDirTitle') : t('op.deleteFileTitle');
       del.onclick = (function (entryName, entryIsDir) {
         return function () { deleteEntry(entryName, entryIsDir); };
       })(e.name, e.dir);
@@ -319,7 +609,7 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
       return e.dir && e.name !== name;
     });
     if (!folders.length) {
-      status('请先新建文件夹', true);
+      setStatus('err.mkdir.first', {}, true);
       return;
     }
     moveSource = name;
@@ -330,7 +620,7 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
       opt.textContent = e.name;
       moveTarget.appendChild(opt);
     });
-    moveInfo.textContent = '将「' + name + '」移动到选中的文件夹（同名条目不会被覆盖）。';
+    setMoveInfo(name);
     moveModal.hidden = false;
     if (typeof moveTarget.focus === 'function') moveTarget.focus();
   }
@@ -345,7 +635,7 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
     var from = moveSource;
     if (!from || !to) { closeMove(); return; }
     closeMove();
-    status('正在移动…');
+    setStatus('status.moving', {}, false);
     var req = new XMLHttpRequest();
     var done = false;
     req.open('POST', '/move.cgi', true);
@@ -356,25 +646,34 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
       if (req.status === 200) {
         /* refresh() clears the status line, so report AFTER refreshing. */
         refresh();
-        status('已移动：' + from + ' → ' + to);
+        setStatus('status.moved', {from: from, to: to}, false);
         return;
       }
-      if (req.status === 401) { status(authHint(), true); return; }
-      if (req.status === 400) { status('移动失败：名称不合法', true); return; }
-      if (req.status === 403) { status('移动失败：' + errorText(req), true); return; }
-      if (req.status === 404) { status('移动失败：源或目标文件夹不存在', true); return; }
-      if (req.status === 409) { status('移动失败：' + errorText(req), true); return; }
-      status('移动失败：HTTP ' + req.status + ' ' + errorText(req), true);
+      if (req.status === 401) { setStatus(authHintKey(), {}, true); return; }
+      if (req.status === 400) { setStatus('err.move.invalidName', {}, true); return; }
+      if (req.status === 403) {
+        setStatus('err.move.failed', {detail: errorText(req)}, true);
+        return;
+      }
+      if (req.status === 404) { setStatus('err.move.missing', {}, true); return; }
+      if (req.status === 409) {
+        setStatus('err.move.failed', {detail: errorText(req)}, true);
+        return;
+      }
+      setStatus('err.move.http', {code: req.status, detail: errorText(req)}, true);
     };
     req.onerror = function () {
       if (done) return;
       done = true;
-      status('移动失败：网络错误，请检查连接后重试', true);
+      setStatus('err.move.network', {}, true);
     };
     try {
       req.send('name=' + encodeURIComponent(from) + '&to=' + encodeURIComponent(to));
     } catch (err) {
-      if (!done) { done = true; status('移动失败：' + err.message, true); }
+      if (!done) {
+        done = true;
+        setStatus('err.move.failed', {detail: err.message}, true);
+      }
     }
   }
 
@@ -384,7 +683,7 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
   function openPasswd() {
     newPass1.value = '';
     newPass2.value = '';
-    passwdMsg.textContent = '';
+    clearPasswdMsg();
     passwdModal.hidden = false;
     if (typeof newPass1.focus === 'function') newPass1.focus();
   }
@@ -393,25 +692,25 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
     passwdModal.hidden = true;
     newPass1.value = '';
     newPass2.value = '';
-    passwdMsg.textContent = '';
+    clearPasswdMsg();
   }
 
   function submitPasswd() {
     var pass = newPass1.value;
-    if (!pass) { passwdMsg.textContent = '请输入新密码'; return; }
-    if (pass !== newPass2.value) { passwdMsg.textContent = '两次密码不一致'; return; }
-    if (/[\x00-\x1f\x7f]/.test(pass)) { passwdMsg.textContent = '密码不能包含控制字符'; return; }
-    if (utf8Bytes(pass) > 200) { passwdMsg.textContent = '密码不能超过 200 字节'; return; }
+    if (!pass) { setPasswdMsg('passwd.empty', {}); return; }
+    if (pass !== newPass2.value) { setPasswdMsg('passwd.mismatch', {}); return; }
+    if (/[\x00-\x1f\x7f]/.test(pass)) { setPasswdMsg('passwd.control', {}); return; }
+    if (utf8Bytes(pass) > 200) { setPasswdMsg('passwd.toolong', {}); return; }
 
-    passwdMsg.textContent = '';
+    clearPasswdMsg();
     passwdConfirm.disabled = true;
-    status('正在修改密码…');
+    setStatus('status.passwd.changing', {}, false);
     var req = new XMLHttpRequest();
     var done = false;
     req.open('POST', '/chpasswd.cgi', true);
     req.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
 
-    function finish(ok, message, isError) {
+    function finish(ok, key, params, isError) {
       if (done) return;
       done = true;
       passwdConfirm.disabled = false;
@@ -421,7 +720,7 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
         authStale = true;
         closePasswd();
       }
-      status(message, isError);
+      setStatus(key, params, isError);
     }
 
     req.onreadystatechange = function () {
@@ -429,31 +728,26 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
       if (req.status === 200) {
         /* No refresh(): the cached old credentials would immediately 401
          * and hide this explanation.  authStale makes any later 401 say why. */
-        finish(true,
-          '密码已修改，请用新密码重新登录：请关闭并重新打开浏览器（或清除本站登录信息）后重新登录；当前页面仍缓存旧口令，直接刷新会提示认证失败。',
-          false);
+        finish(true, 'passwd.success', {}, false);
         return;
       }
-      if (req.status === 401) { finish(false, authHint(), true); return; }
-      if (req.status === 400) {
-        passwdMsg.textContent = '修改失败：' + errorText(req);
-        finish(false, '修改失败：' + errorText(req), true);
+      if (req.status === 401) { finish(false, authHintKey(), {}, true); return; }
+      if (req.status === 400 || req.status === 403) {
+        var detail = errorText(req);
+        setPasswdMsg('err.passwd.failed', {detail: detail});
+        finish(false, 'err.passwd.failed', {detail: detail}, true);
         return;
       }
-      if (req.status === 403) {
-        passwdMsg.textContent = '修改失败：' + errorText(req);
-        finish(false, '修改失败：' + errorText(req), true);
-        return;
-      }
-      finish(false, '修改失败：HTTP ' + req.status + ' ' + errorText(req), true);
+      finish(false, 'err.passwd.http',
+        {code: req.status, detail: errorText(req)}, true);
     };
     req.onerror = function () {
-      finish(false, '修改失败：网络错误，请检查连接后重试', true);
+      finish(false, 'err.passwd.network', {}, true);
     };
     try {
       req.send('new_password=' + encodeURIComponent(pass));
     } catch (err) {
-      finish(false, '修改失败：' + err.message, true);
+      finish(false, 'err.passwd.failed', {detail: err.message}, true);
     }
   }
 
@@ -462,34 +756,39 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
   passwdCancel.onclick = closePasswd;
 
   function deleteEntry(name, isDir) {
-    var question = isDir
-      ? '确认删除文件夹「' + name + '」？（仅空文件夹可删除）'
-      : '确认删除文件「' + name + '」？此操作不可恢复。';
+    var question = t(isDir ? 'confirm.deleteDir' : 'confirm.deleteFile', {name: name});
     if (!window.confirm(question)) return;
     var req = new XMLHttpRequest();
     req.open('POST', '/delete.cgi', true);
     req.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
     req.onreadystatechange = function () {
       if (req.readyState !== 4) return;
-      if (req.status === 200) { status('已删除：' + name); refresh(); return; }
-      if (req.status === 401) { status(authHint(), true); return; }
-      if (req.status === 404) { status('删除失败：条目不存在', true); return; }
-      if (req.status === 409) { status('删除失败：文件夹非空，请先清空内容', true); return; }
-      status('删除失败：HTTP ' + req.status + ' ' + req.responseText, true);
+      if (req.status === 200) {
+        setStatus('status.deleted', {name: name}, false);
+        refresh();
+        return;
+      }
+      if (req.status === 401) { setStatus(authHintKey(), {}, true); return; }
+      if (req.status === 404) { setStatus('err.delete.missing', {}, true); return; }
+      if (req.status === 409) { setStatus('err.delete.notEmpty', {}, true); return; }
+      setStatus('err.delete.http', {code: req.status, detail: req.responseText}, true);
     };
     req.send('name=' + encodeURIComponent(name));
   }
 
   function refresh() {
-    status('');
+    clearStatus();
     var req = new XMLHttpRequest();
     req.open('GET', '/list.cgi', true);
     req.onreadystatechange = function () {
       if (req.readyState !== 4) return;
-      if (req.status === 401) { status(authHint(), true); return; }
-      if (req.status !== 200) { status('列表读取失败：HTTP ' + req.status, true); return; }
+      if (req.status === 401) { setStatus(authHintKey(), {}, true); return; }
+      if (req.status !== 200) {
+        setStatus('err.list.http', {code: req.status}, true);
+        return;
+      }
       try { render(JSON.parse(req.responseText)); }
-      catch (err) { status('列表解析失败', true); }
+      catch (err) { setStatus('err.list.parse', {}, true); }
     };
     req.send();
   }
@@ -498,20 +797,28 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
 
   document.getElementById('mkdirBtn').onclick = function () {
     var name = folderEl.value.trim();
-    if (!name) { status('请输入文件夹名称', true); return; }
+    if (!name) { setStatus('err.mkdir.name', {}, true); return; }
     var req = new XMLHttpRequest();
     req.open('POST', '/mkdir.cgi', true);
     req.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
     req.onreadystatechange = function () {
       if (req.readyState !== 4) return;
-      if (req.status === 200) { folderEl.value = ''; status('已创建：' + name); refresh(); }
-      else { status('创建失败：HTTP ' + req.status, true); }
+      if (req.status === 200) {
+        folderEl.value = '';
+        setStatus('status.mkdir.done', {name: name}, false);
+        refresh();
+      } else {
+        setStatus('err.mkdir.http', {code: req.status}, true);
+      }
     };
     req.send('name=' + encodeURIComponent(name));
   };
 
   uploadBtn.onclick = function () {
-    if (!fileEl.files || !fileEl.files.length) { status('请先选择文件', true); return; }
+    if (!fileEl.files || !fileEl.files.length) {
+      setStatus('err.upload.noFile', {}, true);
+      return;
+    }
     /* All selected files go into one POST, so one progress bar reports the
      * progress of the whole batch (accurate and no extra requests). */
     var fd = new FormData();
@@ -526,24 +833,24 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
 
     /* Single exit point: idempotent so onreadystatechange / onerror / a
      * synchronous send() failure cannot double-notify or leave the bar up. */
-    function finalize(ok, message, isError) {
+    function finalize(ok, key, params, isError) {
       if (finished) return;
       finished = true;
       hideProgress();
       uploadBtn.disabled = false;
       /* refresh() clears the status line, so set ours AFTER it. */
       if (ok) { fileEl.value = ''; refresh(); }
-      status(message, isError);
+      setStatus(key, params, isError);
     }
 
     /* Must be set after open() and before send(): progress is for the
      * request body, i.e. the complete multipart batch. */
     req.upload.onprogress = function (e) {
       if (finished) return;
-      var t = nowMs();
-      speedSeen = t;
+      var t1 = nowMs();
+      speedSeen = t1;
       if (!e.lengthComputable || !(e.total > 0)) return;
-      var elapsed = t - speedLastTime;
+      var elapsed = t1 - speedLastTime;
       if (elapsed >= SPEED_SAMPLE_MS) {
         var delta = e.loaded - speedLastLoaded;
         if (delta >= 0 && elapsed > 0) {
@@ -553,7 +860,7 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
             : instant;
         }
         speedLastLoaded = e.loaded;
-        speedLastTime = t;
+        speedLastTime = t1;
       }
       showProgress(e.loaded / e.total * 100, formatSpeed(speedValue));
     };
@@ -563,12 +870,14 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
       if (req.status === 200) {
         var secs = (speedSeen - speedStart) / 1000;
         var avg = (secs > 0 && batchBytes > 0) ? batchBytes / secs : 0;
-        var suffix = avg > 0 ? ' · 平均 ' + formatSpeed(avg) : '';
-        finalize(true, '上传完成：' + String(req.responseText).trim() + suffix, false);
+        var avgText = avg > 0 ? t('status.avg', {speed: formatSpeed(avg)}) : '';
+        finalize(true, 'status.uploaded',
+          {detail: String(req.responseText).trim(), avg: avgText}, false);
       } else if (req.status === 401) {
-        finalize(false, authHint(), true);
+        finalize(false, authHintKey(), {}, true);
       } else {
-        finalize(false, '上传失败：HTTP ' + req.status + ' ' + req.responseText, true);
+        finalize(false, 'err.upload.http',
+          {code: req.status, detail: req.responseText}, true);
       }
     };
 
@@ -576,19 +885,20 @@ select{border:1px solid var(--line);border-radius:6px;padding:8px 10px;backgroun
      * minutes, and a fixed deadline would report false failures.  onerror
      * covers aborts, network loss and the server closing the connection. */
     req.onerror = function () {
-      finalize(false, '上传失败：网络错误，请检查连接后重试', true);
+      finalize(false, 'err.upload.network', {}, true);
     };
 
     uploadBtn.disabled = true;
     showProgress(0, '');
-    status('正在上传…');
+    setStatus('status.uploading', {}, false);
     try {
       req.send(fd);
     } catch (err) {
-      finalize(false, '上传失败：' + err.message, true);
+      finalize(false, 'err.upload.failed', {detail: err.message}, true);
     }
   };
 
+  setLang(loadLang());
   refresh();
 }());
 </script>

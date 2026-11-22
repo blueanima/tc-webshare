@@ -1,5 +1,63 @@
 # Changelog / 变更记录
 
+## v1.0.9 — 2026-11-22 — 网页界面中英文切换 / Bilingual web UI
+
+网页管理界面新增**中文 / English 即时切换**。工具栏末尾的「界面语言 / Language」
+下拉框（选项为语言本名「中文」「English」）选择后立即更新全部界面文案；
+选择写入浏览器 `localStorage` 的 `tcws-lang`，下次打开自动套用。
+无 `localStorage`（隐私模式/被禁用）或存储值不是 `en` 时一律回退中文，
+首次访问默认中文，不读取 `navigator.language`，保持原有行为。
+
+所有可见文案（含藏在 JS 里的状态、确认、错误分支、弹窗说明、表头与
+placeholder/title 提示）统一抽到内联 `I18N = { zh: {...}, en: {...} }` 词条表，
+共 70 个 key，中英一一对应；JS 通过 `t(key, params)` 取词，`{name}` /
+`{from}` / `{to}` / `{detail}` / `{code}` / `{avg}` 占位符支持参数替换。
+静态节点在 `setLang()` 中按 id 映射统一刷新；已渲染的文件列表直接复用
+`currentEntries` 重绘（按钮文字、title、空列表提示），不额外请求 `/list.cgi`；
+当前状态行、改密弹窗的错误提示、移动弹窗的「将…移动到…」说明也会同步换语言，
+弹窗开合状态与输入内容不受影响。英文文案按原意翻译，安全提示使用
+"irreversible" / "trusted networks only" 等地道表达。
+
+本次为**纯前端改动**：只改 `deploy/index.html`，不引任何 CDN/i18n 库，
+不改任何 C 源码与二进制（`httpd` / `upload.cgi` / `manage.cgi` 哈希不变），
+不触碰口令、不连真机、未部署、未重启服务，待 QA 验证后再换 `index.html`。
+
+验证：新增 `tests/index_i18n_test.js`（7 组：默认中文与静态文案、切换后列表
+重绘且无额外请求、动态状态重渲染、弹窗提示与占位符、持久化与回退、
+70 key 中英一致且词条表外无硬编码中文、上传路径双语回归）全部通过；
+原 `tests/index_ui_test.js` 8 组（v1.0.5 上传/finalize、v1.0.6 移动、
+v1.0.8 密码）保持全过；内联 JS `node --check` 通过。
+
+Added an instant **Chinese / English** switch to the web management UI. The
+"Language" dropdown at the end of the toolbar (labelled with the endonyms
+「中文」/「English」) updates every visible string immediately. The choice is
+stored in `localStorage` under `tcws-lang` and restored on the next load.
+When storage is unavailable (private mode / disabled) or holds anything other
+than `en`, the UI falls back to Chinese; first visits are Chinese and
+`navigator.language` is deliberately ignored.
+
+All visible copy, including status/confirmation/error messages previously
+buried in JS, is now in one inline `I18N = { zh: {...}, en: {...} }` table with
+70 one-to-one keys. JS resolves strings through `t(key, params)` with
+`{name}` / `{from}` / `{to}` / `{detail}` / `{code}` / `{avg}` placeholders.
+Static nodes are refreshed by id in `setLang()`; the rendered file list is
+redrawn from the cached `currentEntries` (button text, titles, empty-state
+hint) with **no extra `/list.cgi` request**. The current status line, the
+password modal's validation error and the move modal's hint are also
+translated in place, without closing modals or clearing inputs. The English
+wording keeps the security meaning ("irreversible", "trusted networks only").
+
+This is a **frontend-only** change: only `deploy/index.html` was modified; no
+CDN or i18n library is used; no C source or binary changed (`httpd`,
+`upload.cgi`, `manage.cgi` hashes unchanged); no credentials, device access,
+deployment or service restart were involved. QA validation is pending.
+
+Verified with the new `tests/index_i18n_test.js` (7 groups: default Chinese,
+static copy, list re-render without refetch, dynamic status, modal hints and
+placeholders, persistence/fallback, 70-key parity with no hardcoded Chinese
+outside the table, bilingual upload regression) and the original 8 groups in
+`tests/index_ui_test.js`; inline JS passes `node --check`.
+
 ## v1.0.8 — 2026-11-22 — 网页改密码 / Web password change
 
 网页管理界面顶部新增「修改密码」按钮与弹窗（新密码 + 确认密码，

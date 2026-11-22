@@ -221,6 +221,16 @@ toolbar offers **file upload** (multiple files, with a live progress bar),
 size, UTC mtime, download link, a **move** button, a **delete** button and
 directory markers, rendered from `/list.cgi` (JSON) without any CDN.
 
+**Bilingual UI (v1.0.9):** the toolbar's **Language** dropdown switches between
+中文 and English instantly. All copy — including status messages, confirmation
+dialogs, error branches and tooltips — comes from one inline `I18N` table; the
+rendered file list is redrawn from cached data, so switching does not add a
+`/list.cgi` request or disturb open modals. The choice is saved under the
+`tcws-lang` key in `localStorage`; the first visit defaults to Chinese, and
+`navigator.language` is deliberately ignored. If storage is unavailable or
+holds an unknown value, the UI falls back to Chinese. This is a frontend-only
+change: no CDN/library, no CGI or binary changes.
+
 All selected files are posted in one multipart request; the progress bar
 therefore reports the **whole batch** (`req.upload.onprogress`), and the
 upload button is disabled until the response arrives. The label shows both
@@ -509,6 +519,13 @@ TC_WEB_PASS_HASH='$1$xxxx$....' ./deploy/install.sh
 *（截图为真机 v1.0.6 版本所摄；说明见 [docs/screenshots/README.md](docs/screenshots/README.md)。）*
 
 浏览器打开 `http://<设备IP>:8080/` 并通过 Basic auth 后，会自动看到隐藏的管理首页：顶部工具栏提供**多文件上传**（带实时进度条）、**新建文件夹**、刷新、**修改密码**（v1.0.8）；下方表格显示顶层文件名、大小、UTC 修改时间、下载链接、**移动**按钮、**删除**按钮与目录标记，由 `/list.cgi`（JSON）渲染，完全离线、无外部 CDN。点击「移动」会从当前列表的文件夹中选择目标（排除自身），确认后调用 `/move.cgi`；若还没有任何文件夹，会提示「请先新建文件夹」。
+
+**中英文切换（v1.0.9）**：工具栏的「界面语言 / Language」下拉框可在中文与
+English 之间即时切换。所有文案（状态提示、确认弹窗、错误分支、提示文字等）
+统一来自内联 `I18N` 词条表；文件列表用缓存数据重绘，切换语言不会额外请求
+`/list.cgi`，也不会打断已打开的弹窗或清空输入。选择保存在浏览器
+`localStorage` 的 `tcws-lang` 键，首次访问默认中文（不依据 `navigator.language`），
+存储不可用或值非法时回退中文。此版本仅改前端，不引 CDN/库，不改 CGI 与二进制。
 
 所选多个文件仍一次性 POST，因此进度条显示**整批**上传进度（`req.upload.onprogress`），上传期间禁用上传按钮。v1.0.5 起进度文字同时显示百分比与**平滑后的实时速度**（如 `45% · 2.3 MB/s`），完成消息附上整批平均速度；成功、网络错误与 `send()` 同步异常都会隐藏进度条并恢复按钮。故意不设 `req.timeout`，避免慢速网络上的大文件被误判超时。
 
